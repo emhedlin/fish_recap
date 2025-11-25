@@ -559,20 +559,6 @@ uv run pytest tests/test_matching.py
 uv run pytest --cov=src tests/
 ```
 
-### Code Style
-
-- **Formatting**: Black (line length: 100)
-- **Linting**: Ruff
-- **Type Hints**: Required for all functions
-- **Docstrings**: Google-style
-
-### Adding New Features
-
-1. Create feature branch
-2. Add tests for new functionality
-3. Update `PROGRESS.md` if needed
-4. Submit pull request
-
 ## References
 
 ### Papers
@@ -592,21 +578,3 @@ uv run pytest --cov=src tests/
 - [Wild-ID](https://github.com/wildmeorg/wildbook) - Similar approach for wildlife ID
 - [StripeSpotter](https://github.com/mayanklahiri/stripespotter) - Zebra identification
 
-## License
-
-MIT License - See LICENSE file for details
-
-## Contributing
-
-Contributions welcome! Please:
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality
-4. Submit a pull request
-
-For questions or issues, please open a GitHub issue.
-
----
-
-**Last Updated:** 2025-01-21  
-**Status:** Preprocessing Pipeline Complete + HotSpotter Matching Engine Implemented
