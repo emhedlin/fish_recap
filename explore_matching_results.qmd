@@ -1,0 +1,648 @@
+---
+title: "Fish Re-Identification Matching Results Explorer"
+format: 
+  html:
+    toc: true
+    toc-depth: 3
+    code-fold: false
+    code-tools: true
+    theme: cosmo
+execute:
+  warning: false
+  message: false
+---
+
+## Setup
+
+```{python}
+#| label: setup
+#| include: false
+
+import json
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+import re
+
+import polars as pl
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+from plotnine import *
+
+# Set paths
+PROJECT_ROOT = Path(".")
+RESULTS_PATH = PROJECT_ROOT / "data" / "results" / "matching_results.json"
+METRICS_PATH = PROJECT_ROOT / "data" / "metadata" / "metrics.json"
+STANDARDIZED_DIR = PROJECT_ROOT / "data" / "processed" / "standardized"
+
+# Display settings
+plt.rcParams['figure.figsize'] = (12, 6)
+plt.rcParams['figure.dpi'] = 100
+```
+
+## Understanding the Matching Algorithm
+
+This notebook explores results from a **local feature matching** pipeline designed to re-identify individual fish by matching their natural spot patterns. The matching process consists of three main stages:
+
+### Stage 1: Feature Extraction (SIFT)
+
+**SIFT (Scale-Invariant Feature Transform)** detects distinctive "keypoints" (spots) on each fish image and computes a 128-dimensional descriptor vector for each keypoint. These descriptors capture the local appearance around each spot in a way that is:
+
+- **Scale-invariant**: Works even if fish appear at different sizes
+- **Rotation-invariant**: Works even if fish are rotated
+- **Illumination-robust**: Handles different lighting conditions
+
+Each fish image typically produces hundreds of keypoints, each representing a unique spot or pattern on the fish's body.
+
+**Keypoint properties:**
+- `pt`: (x, y) pixel coordinates of the spot
+- `size`: Scale at which the feature was detected
+- `angle`: Dominant orientation
+- `response`: Strength/quality of the feature
+
+### Stage 2: Feature Matching (FLANN + Lowe's Ratio Test)
+
+**FLANN (Fast Library for Approximate Nearest Neighbors)** efficiently finds similar descriptors between two fish images. For each keypoint in the query fish, FLANN finds the two most similar keypoints in the database fish.
+
+**Lowe's Ratio Test** filters out ambiguous matches:
+- For each query keypoint, we get the best match (distance $d_1$) and second-best match (distance $d_2$)
+- We only keep the match if $d_1 < 0.75 \times d_2$
+- This ensures the match is **distinctive** - the best match is significantly better than alternatives
+
+**Result:** A list of "putative matches" - pairs of keypoints that appear similar between the two fish images.
+
+### Stage 3: Geometric Verification (RANSAC)
+
+**RANSAC (Random Sample Consensus)** verifies that matching keypoints form a **geometrically consistent pattern**. This is crucial because:
+
+- Wood grain in the background might accidentally match wood grain
+- Random spots might have similar appearance by chance
+- **True matches** should form a consistent spatial relationship (homography transformation)
+
+**How RANSAC works:**
+1. Randomly sample 4 matching point pairs
+2. Estimate a homography transformation (how to map points from Fish A to Fish B)
+3. Count how many other matches are consistent with this transformation (within 5 pixels reprojection error)
+4. Repeat many times (up to 2000 iterations) and keep the best transformation
+5. Points that fit the best transformation are called **inliers**
+
+**Inliers** = Matches that are both:
+- Visually similar (from Stage 2)
+- Geometrically consistent (from Stage 3)
+
+**Outliers** = Matches that are visually similar but don't form a consistent geometric pattern
+
+### Understanding the Match Metrics
+
+Each match result contains several important metrics:
+
+#### **Score** (Match Score)
+- **Definition**: Simply the **number of inliers** (geometrically consistent matches)
+- **Range**: Typically 0-50+ (higher is better)
+- **Interpretation**: 
+  - Score ≥ 20: Strong match, likely the same fish
+  - Score 10-19: Moderate match, worth investigating
+  - Score < 10: Weak match, probably different fish
+- **Why this metric**: More inliers = more spots that match in both appearance and spatial arrangement
+
+#### **Inliers**
+- **Definition**: Number of matching keypoints that pass geometric verification
+- **Interpretation**: The "good matches" that form a consistent pattern
+- **Example**: If 24 inliers, it means 24 spots matched correctly between the two fish
+
+#### **Total Matches**
+- **Definition**: Number of putative matches found before geometric verification
+- **Interpretation**: How many spots appeared similar initially
+- **Note**: This includes both inliers and outliers
+
+#### **Inlier Ratio**
+- **Definition**: `inliers / total_matches` (percentage of matches that are geometrically consistent)
+- **Range**: 0.0 to 1.0 (higher is better)
+- **Interpretation**:
+  - Ratio > 0.5: Very high quality match (most matches are consistent)
+  - Ratio 0.3-0.5: Good quality match
+  - Ratio < 0.3: Lower quality (many false matches filtered out)
+- **Why it matters**: A high score with low ratio might indicate many false positives were filtered out
+
+### Example Scenario
+
+Imagine comparing Fish A (query) to Fish B (database):
+
+1. **SIFT extracts** 500 keypoints from Fish A, 480 from Fish B
+2. **FLANN finds** 80 putative matches (spots that look similar)
+3. **RANSAC verifies** that 24 of these matches form a consistent geometric pattern
+4. **Result**: 
+   - Score = 24 (number of inliers)
+   - Total matches = 80 (putative matches)
+   - Inlier ratio = 24/80 = 0.30 (30% of matches are geometrically consistent)
+
+### Why This Approach Works for Fish Re-Identification
+
+1. **Natural patterns**: Fish spots are unique, distinctive features (like fingerprints)
+2. **Robust to variation**: SIFT handles scale, rotation, and lighting changes
+3. **Geometric consistency**: RANSAC ensures matches aren't just random similarities
+4. **Interpretable**: You can visualize which spots matched and verify manually
+
+### Current Configuration
+
+The matching pipeline uses these parameters (from `configs/config.yaml`):
+
+- **RANSAC threshold**: 5.0 pixels (maximum reprojection error for inliers)
+- **Minimum inliers**: 10 (matches with fewer inliers are rejected)
+- **Ratio threshold**: 0.75 (Lowe's ratio test)
+- **Confidence**: 0.99 (RANSAC confidence level)
+
+## Load Data
+
+```{python}
+#| label: load-data
+
+# Load matching results
+with open(RESULTS_PATH, 'r') as f:
+    matching_results = json.load(f)
+
+# Load metrics
+with open(METRICS_PATH, 'r') as f:
+    metrics_data = json.load(f)
+
+print(f"Loaded matching results for {len(matching_results)} query images")
+print(f"Loaded metrics for {len(metrics_data)} images")
+```
+
+## Data Preparation
+
+```{python}
+#| label: prepare-data
+
+def extract_fish_id(image_name: str) -> Optional[str]:
+    """Extract fish ID from image name (e.g., CSDD001L_standardized -> CSDD001L)."""
+    match = re.match(r'([A-Z]+\d+[LR])', image_name)
+    return match.group(1) if match else None
+
+def extract_side(image_name: str) -> Optional[str]:
+    """Extract side from image name (L or R)."""
+    match = re.search(r'([LR])', image_name)
+    return match.group(1) if match else None
+
+# Convert matching results to polars DataFrame
+match_rows = []
+for query_id, matches in matching_results.items():
+    fish_id = extract_fish_id(query_id)
+    side = extract_side(query_id)
+    
+    for match in matches:
+        match_fish_id = extract_fish_id(match["match_id"])
+        match_side = extract_side(match["match_id"])
+        
+        match_rows.append({
+            "query_id": query_id,
+            "query_fish_id": fish_id,
+            "query_side": side,
+            "match_id": match["match_id"],
+            "match_fish_id": match_fish_id,
+            "match_side": match_side,
+            "score": match["score"],
+            "inliers": match["inliers"],
+            "total_matches": match["total_matches"],
+            "inlier_ratio": match["inliers"] / match["total_matches"] if match["total_matches"] > 0 else 0.0,
+        })
+
+matches_df = pl.DataFrame(match_rows)
+
+# Create summary statistics
+summary_stats = matches_df.select([
+    pl.count().alias("total_matches"),
+    pl.col("score").mean().alias("mean_score"),
+    pl.col("score").median().alias("median_score"),
+    pl.col("score").min().alias("min_score"),
+    pl.col("score").max().alias("max_score"),
+    pl.col("inliers").mean().alias("mean_inliers"),
+    pl.col("inlier_ratio").mean().alias("mean_inlier_ratio"),
+])
+
+print("Summary Statistics:")
+print(summary_stats)
+```
+
+## Score Distribution
+
+```{python}
+#| label: score-distribution
+
+# Histogram of match scores
+# Remember: Score = number of inliers (geometrically consistent matches)
+# Higher scores indicate stronger matches
+(
+    ggplot(matches_df, aes(x="score"))
+    + geom_histogram(bins=30, fill="steelblue", alpha=0.7)
+    + labs(
+        title="Distribution of Match Scores",
+        x="Match Score (Number of Inliers)",
+        y="Frequency"
+    )
+    + theme_minimal()
+    + scale_x_continuous(limits = (0,100))
+    + theme(plot_title=element_text(size=14, face="bold"))
+)
+
+print(p1)
+
+# Box plot of scores by query side
+(
+    ggplot(matches_df, aes(x="query_side", y="score", fill="query_side"))
+    + geom_boxplot(alpha=0.7)
+    + labs(
+        title="Match Score Distribution by Query Side",
+        x="Query Side",
+        y="Match Score"
+    )
+    + theme_minimal()
+    + theme(plot_title=element_text(size=14, face="bold"), legend_position="none")
+)
+
+print(p2)
+```
+
+## Top Matches Analysis
+
+```{python}
+#| label: top-matches
+
+# Get top match for each query
+top_matches = (
+    matches_df
+    .sort(["query_id", "score"], descending=[False, True])
+    .group_by("query_id")
+    .first()
+    .sort("score", descending=True)
+)
+
+print("Top 20 Highest Scoring Matches:")
+print(top_matches.head(20).select([
+    "query_id", "match_id", "score", "inliers", "total_matches", "inlier_ratio"
+]))
+
+# Distribution of top match scores
+(
+    ggplot(top_matches.to_pandas(), aes(x="score"))
+    + geom_histogram(bins=20, fill="darkgreen", alpha=0.7)
+    + labs(
+        title="Distribution of Top Match Scores (Best Match per Query)",
+        x="Top Match Score",
+        y="Frequency"
+    )
+    + theme_minimal()
+    + theme(plot_title=element_text(size=14, face="bold"))
+)
+
+print(p3)
+```
+
+## Left/Right Pair Validation
+
+```{python}
+#| label: pair-validation
+
+# Check if left/right pairs of the same fish match each other
+# This is our "ground truth" test: CSDD001L should match CSDD001R (same fish, different side)
+# A successful match here validates that the algorithm can identify the same fish
+pair_matches = []
+
+for query_id, matches in matching_results.items():
+    query_fish_id = extract_fish_id(query_id)
+    query_side = extract_side(query_id)
+    
+    if query_fish_id is None or query_side is None:
+        continue
+    
+    # Find the expected pair (opposite side, same fish ID)
+    expected_pair_id = f"{query_fish_id}{'R' if query_side == 'L' else 'L'}_standardized"
+    
+    # Look for this pair in matches
+    for match in matches:
+        if match["match_id"] == expected_pair_id:
+            pair_matches.append({
+                "query_id": query_id,
+                "query_fish_id": query_fish_id,
+                "query_side": query_side,
+                "expected_pair": expected_pair_id,
+                "found": True,
+                "rank": matches.index(match) + 1,
+                "score": match["score"],
+                "inliers": match["inliers"],
+                "total_matches": match["total_matches"],
+            })
+            break
+    else:
+        # Pair not found in matches
+        pair_matches.append({
+            "query_id": query_id,
+            "query_fish_id": query_fish_id,
+            "query_side": query_side,
+            "expected_pair": expected_pair_id,
+            "found": False,
+            "rank": None,
+            "score": None,
+            "inliers": None,
+            "total_matches": None,
+        })
+
+pair_df = pl.DataFrame(pair_matches)
+
+# Summary of pair matching
+pair_summary = pair_df.select([
+    pl.count().alias("total_queries"),
+    pl.col("found").sum().alias("pairs_found"),
+    (pl.col("found").sum() / pl.count() * 100).alias("pair_match_rate_pct"),
+    pl.col("rank").filter(pl.col("found")).mean().alias("mean_rank_when_found"),
+    pl.col("score").filter(pl.col("found")).mean().alias("mean_score_when_found"),
+])
+
+print("Left/Right Pair Matching Summary:")
+print(pair_summary)
+
+# Distribution of ranks when pair is found
+found_pairs = pair_df.filter(pl.col("found"))
+if len(found_pairs) > 0:
+    p4 = (
+        ggplot(found_pairs.to_pandas(), aes(x="rank"))
+        + geom_histogram(bins=20, fill="coral", alpha=0.7)
+        + labs(
+            title="Rank Distribution of Correct Left/Right Pair Matches",
+            x="Match Rank (1 = Best Match)",
+            y="Frequency"
+        )
+        + theme_minimal()
+        + theme(plot_title=element_text(size=14, face="bold"))
+    )
+    print(p4)
+```
+
+## Match Quality Metrics
+
+```{python}
+#| label: quality-metrics
+
+# Analyze inlier ratio (quality indicator)
+# Inlier ratio = inliers / total_matches
+# Higher ratio means more of the putative matches were geometrically consistent
+# This is a measure of match "quality" or "confidence"
+quality_analysis = matches_df.select([
+    pl.col("inlier_ratio").mean().alias("mean_inlier_ratio"),
+    pl.col("inlier_ratio").median().alias("median_inlier_ratio"),
+    (pl.col("inlier_ratio") > 0.3).sum().alias("high_quality_matches"),
+    (pl.col("inlier_ratio") > 0.5).sum().alias("very_high_quality_matches"),
+])
+
+print("Match Quality Analysis:")
+print(quality_analysis)
+
+# Scatter plot: score vs inlier ratio
+p5 = (
+    ggplot(matches_df.to_pandas(), aes(x="inlier_ratio", y="score"))
+    + geom_point(alpha=0.3, size=1)
+    + labs(
+        title="Match Score vs Inlier Ratio",
+        x="Inlier Ratio",
+        y="Match Score (Number of Inliers)"
+    )
+    + theme_minimal()
+    + theme(plot_title=element_text(size=14, face="bold"))
+)
+
+print(p5)
+```
+
+## Interactive Match Explorer
+
+```{python}
+#| label: match-explorer
+
+def display_match_comparison(
+    query_id: str,
+    match_id: str,
+    matches_df: pl.DataFrame,
+    standardized_dir: Path,
+    top_n: int = 5
+) -> None:
+    """Display side-by-side comparison of query and match images."""
+    
+    # Get match details
+    match_info = matches_df.filter(
+        (pl.col("query_id") == query_id) & (pl.col("match_id") == match_id)
+    )
+    
+    if len(match_info) == 0:
+        print(f"No match found between {query_id} and {match_id}")
+        return
+    
+    match_info = match_info.to_dicts()[0]
+    
+    # Load images
+    query_path = standardized_dir / f"{query_id}.png"
+    match_path = standardized_dir / f"{match_id}.png"
+    
+    if not query_path.exists():
+        print(f"Query image not found: {query_path}")
+        return
+    
+    if not match_path.exists():
+        print(f"Match image not found: {match_path}")
+        return
+    
+    query_img = Image.open(query_path)
+    match_img = Image.open(match_path)
+    
+    # Create figure
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    
+    axes[0].imshow(query_img)
+    axes[0].set_title(f"Query: {query_id}\nScore: {match_info['score']:.1f}, "
+                     f"Inliers: {match_info['inliers']}, "
+                     f"Total Matches: {match_info['total_matches']}",
+                     fontsize=12, fontweight='bold')
+    axes[0].axis('off')
+    
+    axes[1].imshow(match_img)
+    axes[1].set_title(f"Match: {match_id}\nInlier Ratio: {match_info['inlier_ratio']:.2%}",
+                     fontsize=12, fontweight='bold')
+    axes[1].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Show top N matches for this query
+    top_matches_for_query = (
+        matches_df
+        .filter(pl.col("query_id") == query_id)
+        .sort("score", descending=True)
+        .head(top_n)
+    )
+    
+    print(f"\nTop {top_n} matches for {query_id}:")
+    print(top_matches_for_query.select([
+        "match_id", "score", "inliers", "total_matches", "inlier_ratio"
+    ]))
+
+# Example: Explore a specific match
+# Uncomment and modify to explore specific matches
+# display_match_comparison(
+#     "CSDD001L_standardized",
+#     "CSDD001R_standardized",  # Expected pair
+#     matches_df,
+#     STANDARDIZED_DIR
+# )
+```
+
+## Match Statistics by Fish ID
+
+```{python}
+#| label: fish-stats
+
+# Aggregate statistics per fish ID
+fish_stats = (
+    matches_df
+    .group_by("query_fish_id")
+    .agg([
+        pl.count().alias("num_matches"),
+        pl.col("score").mean().alias("mean_score"),
+        pl.col("score").max().alias("max_score"),
+        pl.col("inliers").mean().alias("mean_inliers"),
+    ])
+    .sort("mean_score", descending=True)
+)
+
+print("Top 20 Fish IDs by Mean Match Score:")
+print(fish_stats.head(20))
+
+# Fish IDs with highest maximum scores
+print("\nTop 20 Fish IDs by Maximum Match Score:")
+print(fish_stats.sort("max_score", descending=True).head(20))
+```
+
+## Match Visualization Helper
+
+```{python}
+#| label: visualization-helper
+
+def plot_match_rank_distribution(matches_df: pl.DataFrame, top_n: int = 10) -> None:
+    """Plot distribution of match ranks for top N queries."""
+    
+    # Calculate ranks for each query
+    ranked_matches = (
+        matches_df
+        .sort(["query_id", "score"], descending=[False, True])
+        .with_columns([
+            pl.col("score")
+            .rank("dense", descending=True)
+            .over("query_id")
+            .alias("rank")
+        ])
+    )
+    
+    # Filter to top N ranks
+    top_ranks = ranked_matches.filter(pl.col("rank") <= top_n)
+    
+    # Create heatmap-like visualization
+    rank_counts = (
+        top_ranks
+        .group_by("rank")
+        .agg(pl.count().alias("count"))
+        .sort("rank")
+    )
+    
+    p6 = (
+        ggplot(rank_counts.to_pandas(), aes(x="rank", y="count"))
+        + geom_bar(stat="identity", fill="steelblue", alpha=0.7)
+        + labs(
+            title=f"Distribution of Match Ranks (Top {top_n})",
+            x="Match Rank",
+            y="Number of Matches"
+        )
+        + scale_x_continuous(breaks=list(range(1, top_n + 1)))
+        + theme_minimal()
+        + theme(plot_title=element_text(size=14, face="bold"))
+    )
+    
+    print(p6)
+
+plot_match_rank_distribution(matches_df, top_n=10)
+```
+
+## Summary Tables
+
+```{python}
+#| label: summary-tables
+
+# Queries with no matches above threshold
+# Adjust this threshold based on your analysis of score distributions above
+# Lower threshold = more matches (but potentially more false positives)
+# Higher threshold = fewer matches (but higher confidence)
+min_score_threshold = 10
+queries_with_good_matches = (
+    matches_df
+    .filter(pl.col("score") >= min_score_threshold)
+    .select("query_id")
+    .unique()
+)
+
+queries_without_good_matches = (
+    matches_df
+    .select("query_id")
+    .unique()
+    .filter(~pl.col("query_id").is_in(queries_with_good_matches["query_id"]))
+)
+
+print(f"Queries with matches >= {min_score_threshold}: {len(queries_with_good_matches)}")
+print(f"Queries without matches >= {min_score_threshold}: {len(queries_without_good_matches)}")
+
+if len(queries_without_good_matches) > 0:
+    print("\nQueries without good matches:")
+    print(queries_without_good_matches.head(10))
+```
+
+## Notes and Next Steps
+
+This notebook provides tools for exploring fish re-identification matching results. Refer to the **"Understanding the Matching Algorithm"** section above for detailed explanations of:
+
+- How SIFT features are extracted
+- How FLANN matching works
+- What RANSAC geometric verification does
+- What inliers, scores, and inlier ratios mean
+
+### Key Sections:
+
+1. **Score Distribution**: Understand the overall match quality
+   - Look for bimodal distributions (good matches vs. poor matches)
+   - Identify appropriate score thresholds for filtering
+
+2. **Pair Validation**: Check if left/right pairs of the same fish are correctly matched
+   - This is your ground truth validation
+   - High pair match rate = algorithm is working well
+   - Low ranks (rank 1-3) = algorithm correctly identifies same fish as top match
+
+3. **Match Explorer**: Use `display_match_comparison()` to visually inspect specific matches
+   - Uncomment the example code to explore matches
+   - Manually verify if high-scoring matches are actually the same fish
+
+4. **Quality Metrics**: Analyze inlier ratios and match consistency
+   - High inlier ratio = high confidence match
+   - Low inlier ratio = many false matches were filtered out
+
+### Interpreting Results:
+
+- **Score ≥ 20**: Strong match, likely same fish
+- **Score 10-19**: Moderate match, worth manual verification
+- **Score < 10**: Weak match, probably different fish
+- **Inlier ratio > 0.5**: Very high quality match
+- **Inlier ratio 0.3-0.5**: Good quality match
+- **Inlier ratio < 0.3**: Lower quality, but may still be valid if score is high
+
+### Suggested next steps:**
+- Adjust matching thresholds in `configs/config.yaml` based on score distributions
+- Investigate queries with low scores or missing pair matches
+- Validate top matches manually using the visualization function
+- Consider filtering matches by inlier ratio for higher confidence
+- Analyze why certain fish pairs don't match well (image quality, standardization issues, etc.)
+

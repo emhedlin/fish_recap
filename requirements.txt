@@ -1,0 +1,36 @@
+# Core dependencies for Fish Re-Identification Project
+
+# Computer Vision
+opencv-python>=4.8.0
+opencv-contrib-python>=4.8.0  # For SIFT support
+
+# Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# SAM 3 (Segment Anything Model)
+# Note: Install from official SAM repository: git clone https://github.com/facebookresearch/sam3.git
+# Then install with: pip install -e /path/to/sam3
+# Requires Hugging Face authentication for checkpoint access
+# huggingface_hub>=0.20.0  # Included in SAM3 dependencies
+# timm>=1.0.17  # Included in SAM3 dependencies
+# iopath>=0.1.10  # Included in SAM3 dependencies
+
+# DINOv2
+# Note: Install from official repository or transformers library
+# transformers>=4.30.0
+
+# Scientific Computing
+numpy>=1.24.0
+scipy>=1.10.0
+scikit-image>=0.20.0  # For skeletonization and image processing
+scikit-learn>=1.0.0  # For PCA-based rotation alignment
+
+# Data Management
+pyyaml>=6.0
+tqdm>=4.65.0
+
+# Optional: Experiment Tracking
+# tensorboard>=2.13.0
+# wandb>=0.15.0
+

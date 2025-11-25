@@ -1,0 +1,72 @@
+# Configuration file for Fish Re-Identification Project
+
+# Data paths
+data:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  metadata_dir: "data/metadata"
+  masks_dir: "data/processed/masks"
+  standardized_dir: "data/processed/standardized"
+  features_dir: "data/processed/features"
+
+# Model paths
+models:
+  sam3_checkpoint: "models/sam3.pt"
+  dinov2_model: "dinov2_vitb14"
+
+# SAM 3 parameters
+segmentation:
+  prompts: ["whole fish", "fish eye", "dorsal fin", "ruler"]
+  device: "cuda"  # or "cpu"
+  confidence_threshold: 0.5
+
+# Metric extraction parameters
+metric_extraction:
+  tick_detection_method: "sobel"
+  length_measurement_method: "medial_axis"  # or "bounding_box"
+  margin_px: 10
+
+# Standardization parameters
+standardization:
+  rotation_method: "pca"  # or "moments"
+  background_color: [0, 0, 0]  # RGB for black background
+  crop_margin: 0.1  # Fraction of bounding box size
+  ensure_head_right: true  # Ensure head points right for consistency
+  use_image_features: true  # Enable image-based detection (eyes, fins)
+  confidence_threshold: 0.7  # Minimum confidence to accept detection
+  enable_validation: true   # Enable post-processing validation
+  enable_double_check: true # Try both orientations for low confidence
+
+# Feature extraction parameters
+feature_extraction:
+  method: "sift"  # or "rootsift"
+  n_features: 0  # 0 = default
+  contrast_threshold: 0.04
+  edge_threshold: 10
+  sigma: 1.6
+
+# Matching parameters
+matching:
+  method: "hotspotter"  # "hotspotter" (one-vs-many) or "pairwise" (one-vs-one)
+  lnbnn_k: 5  # Number of nearest neighbors for LNBNN scoring (HotSpotter only)
+  top_candidates: 20  # Top N candidates for spatial reranking (HotSpotter only)
+  flann_index_type: 1  # FLANN_INDEX_KDTREE
+  flann_trees: 5
+  flann_checks: 50
+  ratio_threshold: 0.75  # Lowe's ratio test (pairwise only)
+
+# Geometric verification parameters
+geometric_verification:
+  model: "affine"  # "affine" (better for flexible bodies) or "homography" (rigid planar)
+  ransac_threshold: 5.0
+  min_inliers: 10
+  max_iterations: 2000
+  confidence: 0.99
+
+# Deep metric learning parameters
+deep_metric:
+  model_name: "dinov2_vitb14"
+  device: "cuda"
+  batch_size: 1
+  similarity_threshold: 0.7
+
