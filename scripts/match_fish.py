@@ -191,6 +191,15 @@ def run_hotspotter_matching(
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Run HotSpotter one-vs-many matching pipeline.
     
+    This implementation follows the HotSpotter paper methodology:
+    1. LNBNN scoring finds matches across all database images
+    2. The specific descriptor correspondences from LNBNN are preserved
+    3. These matches are used directly for geometric verification (no re-matching)
+    
+    This preserves the advantage of the one-vs-many algorithm, where matches
+    that might fail the Ratio Test can still be valid and distinctive for
+    a specific animal when compared globally.
+    
     Args:
         database: Dictionary mapping image_id to features
         queries: List of query image paths
@@ -220,7 +229,8 @@ def run_hotspotter_matching(
         query_desc = query_feat["descriptors"]
         
         # Step A: LNBNN Scoring (fast, checks all images)
-        lnbnn_scores = global_matcher.query_lnbnn(query_desc, k=lnbnn_k)
+        # Returns both scores and the specific matches that generated them
+        lnbnn_scores, lnbnn_matches = global_matcher.query_lnbnn(query_desc, k=lnbnn_k)
         
         if not lnbnn_scores:
             all_results[query_id] = []
@@ -233,7 +243,7 @@ def run_hotspotter_matching(
             reverse=True
         )[:top_candidates]
         
-        # Step C: Spatial Verification on top candidates
+        # Step C: Spatial Verification on top candidates using LNBNN matches
         query_results = []
         for candidate_id, lnbnn_score in sorted_candidates:
             candidate_feat = database.get(candidate_id)
@@ -241,26 +251,34 @@ def run_hotspotter_matching(
                 continue
                 
             candidate_kp = candidate_feat["keypoints"]
-            candidate_desc = candidate_feat["descriptors"]
             
-            # Use pairwise matcher for spatial verification
-            # (We need point correspondences for RANSAC)
-            pairwise_matcher = FishMatcher(
-                flann_index_type=match_config.get("flann_index_type", 1),
-                flann_trees=match_config.get("flann_trees", 5),
-                flann_checks=match_config.get("flann_checks", 50),
+            # Get matches found during LNBNN scoring for this candidate
+            # These matches have trainIdx referring to global descriptor indices
+            global_matches = lnbnn_matches.get(candidate_id, [])
+            
+            if not global_matches:
+                # No matches found for this candidate during LNBNN scoring
+                continue
+            
+            # Map global descriptor indices to local indices for geometric verification
+            local_matches = global_matcher.map_global_to_local_matches(
+                global_matches, candidate_id
             )
-            matches = pairwise_matcher.match(query_desc, candidate_desc)
             
-            # Geometric Verification
+            if not local_matches:
+                # Failed to map matches (shouldn't happen, but handle gracefully)
+                continue
+            
+            # Geometric Verification using LNBNN matches directly
+            # This preserves the advantage of the one-vs-many algorithm
             num_inliers, H, inlier_matches = verifier.verify(
-                query_kp, candidate_kp, matches
+                query_kp, candidate_kp, local_matches
             )
             
             if num_inliers >= geo_config.get("min_inliers", 10):
                 # Combine LNBNN score with inlier count
                 # Weighted combination: LNBNN score + normalized inlier count
-                inlier_score = verifier.calculate_score(num_inliers, len(matches))
+                inlier_score = verifier.calculate_score(num_inliers, len(local_matches))
                 # Normalize LNBNN score by query descriptor count for fairness
                 normalized_lnbnn = lnbnn_score / max(len(query_desc), 1)
                 combined_score = normalized_lnbnn + inlier_score
@@ -270,7 +288,7 @@ def run_hotspotter_matching(
                     "score": combined_score,
                     "lnbnn_score": lnbnn_score,
                     "inliers": num_inliers,
-                    "total_matches": len(matches)
+                    "total_matches": len(local_matches)
                 })
                 
         # Sort by combined score

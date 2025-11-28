@@ -55,6 +55,39 @@ class NumpyEncoder(json.JSONEncoder):
             return obj.tolist()
         return super(NumpyEncoder, self).default(obj)
 
+
+def save_metrics_atomic(
+    all_results: list[dict],
+    metadata_path: Path,
+) -> None:
+    """Save metrics JSON atomically to prevent corruption on interruption.
+    
+    Writes to a temporary file first, then atomically renames it to the final
+    file. This ensures the JSON file is never left in a half-written state.
+    
+    Args:
+        all_results: List of result dictionaries to save
+        metadata_path: Path to the metrics.json file
+    """
+    if metadata_path is None:
+        return
+    
+    try:
+        # Create parent directory if needed
+        metadata_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Write to temporary file first
+        temp_path = metadata_path.with_suffix('.json.tmp')
+        with open(temp_path, 'w') as f:
+            json.dump(all_results, f, indent=2, cls=NumpyEncoder)
+        
+        # Atomically rename temp file to final file
+        temp_path.replace(metadata_path)
+        logger.debug(f"Incrementally saved metrics to {metadata_path}")
+    except Exception as e:
+        logger.warning(f"Failed to save metrics incrementally: {e}")
+
+
 def load_config(config_path: Path) -> dict:
     """Load configuration from YAML file."""
     with open(config_path, 'r') as f:
@@ -181,7 +214,7 @@ def determine_required_steps(
         required["standardization"] = standardize_flag
     else:
         # Only run what's missing
-        required["segmentation"] = not progress["segmentation"]
+        # Only require segmentation if it's needed for requested operations
         
         # Metrics requires segmentation
         if extract_metrics_flag:
@@ -195,13 +228,13 @@ def determine_required_steps(
         
         # Standardization requires segmentation
         if standardize_flag:
-            if not progress["segmentation"]:
-                # Need segmentation first
-                required["segmentation"] = True
+            if not progress["standardization"]:
+                # Standardization is missing, check if segmentation is needed
+                if not progress["segmentation"]:
+                    # Need segmentation first
+                    required["segmentation"] = True
                 required["standardization"] = True
-            elif not progress["standardization"]:
-                # Segmentation done, standardization missing
-                required["standardization"] = True
+            # If standardization is already done, don't require anything (image will be skipped)
     
     return required
 
@@ -474,10 +507,12 @@ def process_all_images(
     length_method = metric_config.get("length_measurement_method", "medial_axis")
     standardization_config = config.get("standardization", {})
     
+    # Store metadata_path early for incremental saving (even if metadata_dir is None initially)
+    metadata_path = metadata_dir / "metrics.json" if metadata_dir else None
+    
     # Load existing metrics if available to preserve history and speed up skipping
     existing_results = {}
-    if metadata_dir:
-        metadata_path = metadata_dir / "metrics.json"
+    if metadata_dir and metadata_path:
         if metadata_path.exists():
             try:
                 with open(metadata_path, 'r') as f:
@@ -495,12 +530,77 @@ def process_all_images(
             except Exception as e:
                  logger.warning(f"Could not load existing metrics: {e}")
     
+    # Pre-filter images to only those needing work
+    logger.info("Pre-scanning images to determine work needed...")
+    images_to_process = []
+    skipped_pre_count = 0
+    all_results = []
+    all_metrics = []
+    
+    for image_path in tqdm(image_files, desc="Pre-scanning images", leave=False):
+        image_stem = image_path.stem
+        progress = check_image_progress(
+            image_stem,
+            masks_dir,
+            standardized_dir,
+            metadata_dir,
+            qa_dir,
+        )
+        required_steps = determine_required_steps(
+            progress,
+            extract_metrics_flag,
+            standardize_flag,
+            force_reprocess=not skip_existing,
+        )
+        if any(required_steps.values()):
+            images_to_process.append(image_path)
+        else:
+            skipped_pre_count += 1
+            # Still add skipped images to all_results for completeness
+            if image_stem in existing_results:
+                all_results.append(existing_results[image_stem])
+                if extract_metrics_flag and existing_results[image_stem].get("metrics"):
+                    all_metrics.append(existing_results[image_stem]["metrics"])
+            elif extract_metrics_flag and progress["metrics"]:
+                # Try to load metrics for skipped images
+                try:
+                    fish_mask_path = masks_dir / f"{image_stem}_fish_mask.png"
+                    whole_fish_mask_path = masks_dir / f"{image_stem}_whole fish_mask.png"
+                    ruler_mask_path = masks_dir / f"{image_stem}_ruler_mask.png"
+                    
+                    # Determine which body mask exists
+                    body_mask_path = None
+                    if whole_fish_mask_path.exists():
+                        body_mask_path = whole_fish_mask_path
+                    elif fish_mask_path.exists():
+                        body_mask_path = fish_mask_path
+                    
+                    if body_mask_path and ruler_mask_path.exists():
+                        metrics = extract_metrics(
+                            image_path,
+                            body_mask_path,
+                            ruler_mask_path,
+                            length_method=length_method,
+                        )
+                        all_metrics.append(metrics)
+                        all_results.append({
+                            "image": str(image_path),
+                            "metrics": metrics
+                        })
+                except Exception as e:
+                    logger.debug(f"Could not load metrics for {image_path.name}: {e}")
+    
+    logger.info(f"Found {len(images_to_process)} images needing processing out of {len(image_files)} total ({skipped_pre_count} already complete)")
+    
+    # Save metrics for pre-scanned skipped images if any were added
+    if extract_metrics_flag and metadata_path and all_results:
+        save_metrics_atomic(all_results, metadata_path)
+    
     # Process each image
     successful = 0
     failed = 0
-    skipped = 0
-    all_results = []
-    all_metrics = []
+    skipped = skipped_pre_count  # Start with pre-scanned skipped count
+    # all_results and all_metrics already populated from pre-scan
     
     # Summary statistics
     step_counts = {
@@ -509,106 +609,91 @@ def process_all_images(
         "standardization": 0,
     }
     
-    for image_path in tqdm(image_files, desc="Processing images"):
-        image_stem = image_path.stem
-        
-        # Check current progress
-        progress = check_image_progress(
-            image_stem,
-            masks_dir,
-            standardized_dir,
-            metadata_dir,
-            qa_dir,
-        )
-        
-        # Log progress status (at INFO level for first few images, DEBUG for rest)
-        if successful + failed + skipped < 3:
-            logger.info(
-                f"{image_path.name} progress: "
-                f"segmentation={progress['segmentation']}, "
-                f"metrics={progress['metrics']}, "
-                f"standardization={progress['standardization']}"
-            )
-        
-        # Determine what needs to be done
-        required_steps = determine_required_steps(
-            progress,
-            extract_metrics_flag,
-            standardize_flag,
-            force_reprocess=not skip_existing,
-        )
-        
-        # Check if anything needs to be done
-        if not any(required_steps.values()):
-            logger.debug(f"Skipping {image_path.name} (all requested steps already complete)")
-            skipped += 1
+    try:
+        for image_path in tqdm(images_to_process, desc="Processing images"):
+            image_stem = image_path.stem
             
-            # Use existing result if available
-            if image_stem in existing_results:
-                result = existing_results[image_stem]
+            # Check current progress (we already know this needs work, but check again for safety)
+            progress = check_image_progress(
+                image_stem,
+                masks_dir,
+                standardized_dir,
+                metadata_dir,
+                qa_dir,
+            )
+            
+            # Log progress status (at INFO level for first few images, DEBUG for rest)
+            if successful + failed < 3:
+                logger.info(
+                    f"{image_path.name} progress: "
+                    f"segmentation={progress['segmentation']}, "
+                    f"metrics={progress['metrics']}, "
+                    f"standardization={progress['standardization']}"
+                )
+            
+            # Determine what needs to be done
+            required_steps = determine_required_steps(
+                progress,
+                extract_metrics_flag,
+                standardize_flag,
+                force_reprocess=not skip_existing,
+            )
+            
+            # Double-check that work is still needed (should always be true after pre-scan)
+            if not any(required_steps.values()):
+                logger.debug(f"Skipping {image_path.name} (all requested steps already complete)")
+                skipped += 1
+                continue
+            
+            # Log what will be done
+            steps_to_run = [step for step, needed in required_steps.items() if needed]
+            logger.debug(f"Processing {image_path.name}: running steps {', '.join(steps_to_run)}")
+            
+            # Update step counts
+            for step, needed in required_steps.items():
+                if needed:
+                    step_counts[step] += 1
+            
+            try:
+                # Only pass segmenter if segmentation is needed
+                if required_steps["segmentation"] and segmenter is None:
+                    logger.warning(f"Segmentation needed for {image_path.name} but segmenter not loaded. Loading now...")
+                    seg_config = config.get("segmentation", {})
+                    segmenter = SAM3Segmenter(
+                        confidence_threshold=seg_config.get("confidence_threshold", 0.5),
+                        device=seg_config.get("device", "cuda"),
+                    )
+                
+                result = process_single_image(
+                    image_path,
+                    segmenter,  # Can be None if segmentation not needed
+                    masks_dir,
+                    prompts,
+                    required_steps=required_steps,
+                    qa_dir=qa_dir,
+                    standardized_dir=standardized_dir,
+                    length_method=length_method,
+                    standardization_config=standardization_config,
+                )
                 all_results.append(result)
                 if extract_metrics_flag and result.get("metrics"):
                     all_metrics.append(result["metrics"])
-            # Still try to load existing metrics for distribution analysis if not in loaded results
-            elif extract_metrics_flag and progress["metrics"]:
-                try:
-                    fish_mask_path = masks_dir / f"{image_stem}_fish_mask.png"
-                    ruler_mask_path = masks_dir / f"{image_stem}_ruler_mask.png"
-                    if fish_mask_path.exists() and ruler_mask_path.exists():
-                        metrics = extract_metrics(
-                            image_path,
-                            fish_mask_path,
-                            ruler_mask_path,
-                            length_method=length_method,
-                        )
-                        all_metrics.append(metrics)
-                        # Reconstruct basic result
-                        all_results.append({
-                            "image": str(image_path),
-                            "metrics": metrics
-                        })
-                except Exception as e:
-                    logger.debug(f"Could not load metrics for {image_path.name}: {e}")
-            continue
-        
-        # Log what will be done
-        steps_to_run = [step for step, needed in required_steps.items() if needed]
-        logger.debug(f"Processing {image_path.name}: running steps {', '.join(steps_to_run)}")
-        
-        # Update step counts
-        for step, needed in required_steps.items():
-            if needed:
-                step_counts[step] += 1
-        
-        try:
-            # Only pass segmenter if segmentation is needed
-            if required_steps["segmentation"] and segmenter is None:
-                logger.warning(f"Segmentation needed for {image_path.name} but segmenter not loaded. Loading now...")
-                seg_config = config.get("segmentation", {})
-                segmenter = SAM3Segmenter(
-                    confidence_threshold=seg_config.get("confidence_threshold", 0.5),
-                    device=seg_config.get("device", "cuda"),
-                )
-            
-            result = process_single_image(
-                image_path,
-                segmenter,  # Can be None if segmentation not needed
-                masks_dir,
-                prompts,
-                required_steps=required_steps,
-                qa_dir=qa_dir,
-                standardized_dir=standardized_dir,
-                length_method=length_method,
-                standardization_config=standardization_config,
-            )
-            all_results.append(result)
-            if extract_metrics_flag and result.get("metrics"):
-                all_metrics.append(result["metrics"])
-            successful += 1
-            logger.debug(f"Successfully processed {image_path.name}")
-        except Exception as e:
-            failed += 1
-            logger.error(f"Failed to process {image_path.name}: {e}")
+                    # Save metrics incrementally after extraction
+                    if extract_metrics_flag and metadata_path:
+                        save_metrics_atomic(all_results, metadata_path)
+                successful += 1
+                logger.debug(f"Successfully processed {image_path.name}")
+            except Exception as e:
+                failed += 1
+                logger.error(f"Failed to process {image_path.name}: {e}")
+    except KeyboardInterrupt:
+        logger.warning("Processing interrupted by user (KeyboardInterrupt)")
+        # Save metrics before exiting
+        if extract_metrics_flag and metadata_path and all_results:
+            logger.info("Saving metrics before exit...")
+            save_metrics_atomic(all_results, metadata_path)
+            logger.info(f"Metrics saved to {metadata_path}")
+        raise
     
     # Log summary
     logger.info(f"Processing summary:")

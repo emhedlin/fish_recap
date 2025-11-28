@@ -1,0 +1,261 @@
+
+## Setup
+
+```{python}
+import json
+from pathlib import Path
+from typing import Optional
+import re
+import yaml
+import polars as pl
+from PIL import Image
+import matplotlib.pyplot as plt
+
+PROJECT_ROOT = Path(".")
+CONFIG_PATH = PROJECT_ROOT / "configs" / "config.yaml"
+
+with open(CONFIG_PATH, 'r') as f:
+    config = yaml.safe_load(f)
+
+def resolve_path(config_path: str) -> Path:
+    """Resolve path from config, handling both absolute and relative paths."""
+    path = Path(config_path)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+# Set paths from config
+STANDARDIZED_DIR = resolve_path(config["data"]["standardized_dir"])
+RESULTS_PATH = PROJECT_ROOT / "data" / "results" / "matching_results.json"
+
+print(f"Standardized images directory: {STANDARDIZED_DIR}")
+print(f"Matching results file: {RESULTS_PATH}")
+
+# Display settings
+plt.rcParams['figure.figsize'] = (12, 8)
+plt.rcParams['figure.dpi'] = 100
+```
+
+## Load Matching Results
+
+```{python}
+
+with open(RESULTS_PATH, 'r') as f:
+    matching_results = json.load(f)
+
+print(f"Loaded matching results for {len(matching_results)} query images")
+```
+
+## Create Matches DataFrame
+
+```{python}
+#| label: create-dataframe
+
+def extract_fish_id(image_name: str) -> Optional[str]:
+    """Extract fish ID from image name (e.g., CSDD001L_standardized -> CSDD001L)."""
+    match = re.match(r'([A-Z]+\d+[LR])', image_name)
+    return match.group(1) if match else None
+
+def extract_side(image_name: str) -> Optional[str]:
+    """Extract side from image name (L or R)."""
+    match = re.search(r'([LR])', image_name)
+    return match.group(1) if match else None
+
+# Convert matching results to polars DataFrame
+match_rows = []
+for query_id, matches in matching_results.items():
+    fish_id = extract_fish_id(query_id)
+    side = extract_side(query_id)
+    
+    for match in matches:
+        match_fish_id = extract_fish_id(match["match_id"])
+        match_side = extract_side(match["match_id"])
+        
+        match_row = {
+            "query_id": query_id,
+            "query_fish_id": fish_id,
+            "query_side": side,
+            "match_id": match["match_id"],
+            "match_fish_id": match_fish_id,
+            "match_side": match_side,
+            "score": match["score"],
+            "inliers": match["inliers"],
+            "total_matches": match["total_matches"],
+            "inlier_ratio": match["inliers"] / match["total_matches"] if match["total_matches"] > 0 else 0.0,
+        }
+        # Add lnbnn_score if present (optional field in HotSpotter results)
+        if "lnbnn_score" in match:
+            match_row["lnbnn_score"] = match["lnbnn_score"]
+        match_rows.append(match_row)
+
+matches_df = pl.DataFrame(match_rows)
+
+print(f"Created matches_df with {len(matches_df)} total matches")
+print(f"\nDataFrame columns: {matches_df.columns}")
+print(f"\nSample of matches_df:")
+print(matches_df.head(5))
+```
+
+## Fish Comparison Function
+
+```{python}
+#| label: compare-function
+
+def compare_fish(fish_id_1: str, fish_id_2: str, layout: str = "vertical") -> None:
+    """
+    Compare two fish images side by side or stacked vertically.
+    
+    Args:
+        fish_id_1: First fish ID (e.g., "CSDD017R")
+        fish_id_2: Second fish ID (e.g., "CSDD029R")
+        layout: "vertical" (top/bottom) or "horizontal" (side by side)
+    
+    The function will automatically find the standardized images for both fish IDs.
+    It searches for images matching the pattern: {fish_id}_standardized.png
+    """
+    # Construct image paths
+    # Note: fish_id should be like "CSDD017R", image file is "CSDD017R_standardized.png"
+    img1_path = STANDARDIZED_DIR / f"{fish_id_1}_standardized.png"
+    img2_path = STANDARDIZED_DIR / f"{fish_id_2}_standardized.png"
+    
+    # Check if images exist
+    if not img1_path.exists():
+        print(f"Error: Image not found for {fish_id_1}")
+        print(f"  Expected path: {img1_path}")
+        return
+    
+    if not img2_path.exists():
+        print(f"Error: Image not found for {fish_id_2}")
+        print(f"  Expected path: {img2_path}")
+        return
+    
+    # Load images
+    img1 = Image.open(img1_path)
+    img2 = Image.open(img2_path)
+    
+    # Get match information if available
+    match_info = None
+    query_id_1 = f"{fish_id_1}_standardized"
+    match_id_2 = f"{fish_id_2}_standardized"
+    
+    # Try to find match info (fish_id_1 as query, fish_id_2 as match)
+    match_row = matches_df.filter(
+        (pl.col("query_id") == query_id_1) & (pl.col("match_id") == match_id_2)
+    )
+    
+    if len(match_row) > 0:
+        match_info = match_row.to_dicts()[0]
+    
+    # Also try reverse (fish_id_2 as query, fish_id_1 as match)
+    if match_info is None:
+        query_id_2 = f"{fish_id_2}_standardized"
+        match_id_1 = f"{fish_id_1}_standardized"
+        match_row = matches_df.filter(
+            (pl.col("query_id") == query_id_2) & (pl.col("match_id") == match_id_1)
+        )
+        if len(match_row) > 0:
+            match_info = match_row.to_dicts()[0]
+    
+    # Create figure with black background
+    if layout == "vertical":
+        fig, axes = plt.subplots(2, 1, figsize=(10, 12), facecolor='black')
+    else:  # horizontal
+        fig, axes = plt.subplots(1, 2, figsize=(16, 8), facecolor='black')
+    
+    # Set axes background to black
+    for ax in axes:
+        ax.set_facecolor('black')
+    
+    # Display first image
+    axes[0].imshow(img1)
+    title1 = f"{fish_id_1}"
+    if match_info:
+        title1 += f"\nScore: {match_info['score']:.1f} | Inliers: {match_info['inliers']} | Ratio: {match_info['inlier_ratio']:.2%}"
+    axes[0].set_title(title1, fontsize=14, fontweight='bold', color='white')
+    axes[0].axis('off')
+    
+    # Display second image
+    axes[1].imshow(img2)
+    title2 = f"{fish_id_2}"
+    if match_info:
+        title2 += f"\nTotal Matches: {match_info['total_matches']}"
+    axes[1].set_title(title2, fontsize=14, fontweight='bold', color='white')
+    axes[1].axis('off')
+    
+    plt.tight_layout()
+    plt.show()
+    
+    # Print match information if available
+    if match_info:
+        print(f"\nMatch Information:")
+        print(f"  Score: {match_info['score']:.1f}")
+        print(f"  Inliers: {match_info['inliers']}")
+        print(f"  Total Matches: {match_info['total_matches']}")
+        print(f"  Inlier Ratio: {match_info['inlier_ratio']:.2%}")
+    else:
+        print(f"\nNo match information found between {fish_id_1} and {fish_id_2}")
+        print("  (These fish may not have been matched, or match score was below threshold)")
+```
+
+## Example Usage
+
+```{python}
+#| label: example-usage
+
+# Compare two fish (vertical layout - top/bottom)
+compare_fish("CSDD017R1", "CSDD029R", layout="vertical")
+```
+
+## Additional Helper Functions
+
+```{python}
+#| label: helper-functions
+
+def get_top_matches(fish_id: str, top_n: int = 5) -> pl.DataFrame:
+    """
+    Get top N matches for a given fish ID.
+    
+    Args:
+        fish_id: Fish ID (e.g., "CSDD017R")
+        top_n: Number of top matches to return
+    
+    Returns:
+        DataFrame with top matches
+    """
+    query_id = f"{fish_id}_standardized"
+    
+    top_matches = (
+        matches_df
+        .filter(pl.col("query_id") == query_id)
+        .sort("score", descending=True)
+        .head(top_n)
+    )
+    
+    return top_matches
+
+def compare_with_top_match(fish_id: str, rank: int = 1) -> None:
+    """
+    Compare a fish with its top-ranked match.
+    
+    Args:
+        fish_id: Fish ID (e.g., "CSDD017R")
+        rank: Rank of match to compare (1 = best match, 2 = second best, etc.)
+    """
+    top_matches = get_top_matches(fish_id, top_n=rank)
+    
+    if len(top_matches) < rank:
+        print(f"Fish {fish_id} has fewer than {rank} matches")
+        return
+    
+    match_row = top_matches.to_dicts()[rank - 1]
+    match_fish_id = match_row["match_fish_id"]
+    
+    print(f"Comparing {fish_id} with its #{rank} match: {match_fish_id}")
+    compare_fish(fish_id, match_fish_id)
+
+
+
+matches_df.sort('score', descending = True).select('query_fish_id', 'match_fish_id', 'score')
+
+# Example: Compare a fish with its best match
+compare_with_top_match("CSDD001L", rank=1)
+```
+

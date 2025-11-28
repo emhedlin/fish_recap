@@ -112,8 +112,13 @@ class GlobalFishMatcher:
     
     Implements HotSpotter's scalable matching approach:
     - Builds a single FLANN index for all database descriptors
-    - Uses Local Naive Bayes Nearest Neighbor (LNBNN) scoring
-    - Handles ambiguous features naturally by comparing distances
+    - Uses Local Naive Bayes Nearest Neighbor (LNBNN) scoring with squared distances
+    - Preserves specific descriptor correspondences for spatial verification
+    - Handles ambiguous features naturally by comparing distances globally
+    
+    This follows the HotSpotter paper methodology where LNBNN matches are used
+    directly for geometric verification, preserving the advantage of one-vs-many
+    matching over pairwise Ratio Test matching.
     """
     
     def __init__(
@@ -138,6 +143,7 @@ class GlobalFishMatcher:
         # Metadata storage
         self.labels: Optional[np.ndarray] = None  # (N_total,) - image ID indices
         self.label_map: Optional[Dict[int, str]] = None  # int -> image_id string
+        self.descriptor_offsets: Optional[Dict[int, int]] = None  # image_idx -> offset in global array
         self.is_built = False
         
     def build_index(
@@ -178,6 +184,16 @@ class GlobalFishMatcher:
         # Store metadata
         self.labels = all_labels.astype(np.int32)
         self.label_map = label_map
+        
+        # Build descriptor offsets: track where each image's descriptors start in global array
+        self.descriptor_offsets = {}
+        current_offset = 0
+        for img_idx in sorted(label_map.keys()):
+            self.descriptor_offsets[img_idx] = current_offset
+            # Count descriptors for this image
+            n_desc = np.sum(all_labels == img_idx)
+            current_offset += n_desc
+        
         self.is_built = True
         
         logger.info("Global FLANN index built successfully")
@@ -186,7 +202,7 @@ class GlobalFishMatcher:
         self,
         query_descriptors: np.ndarray,
         k: int = 5,
-    ) -> Dict[str, float]:
+    ) -> Tuple[Dict[str, float], Dict[str, List[cv2.DMatch]]]:
         """Query using Local Naive Bayes Nearest Neighbor (LNBNN) scoring.
         
         For each query descriptor:
@@ -194,14 +210,22 @@ class GlobalFishMatcher:
         2. For each candidate image X:
            - d_target = min distance to any descriptor in image X
            - d_other = min distance to any descriptor NOT in image X
-           - score_X += max(0, d_other - d_target)
+           - score_X += max(0, d_other^2 - d_target^2)  # Squared distances per paper
+           - Store match correspondence for spatial verification
+        
+        This preserves the specific descriptor matches found during LNBNN scoring,
+        which is critical for the HotSpotter algorithm. These matches are used directly
+        for geometric verification instead of re-matching with Ratio Test.
         
         Args:
             query_descriptors: Query descriptors (N_query, 128)
             k: Number of nearest neighbors to consider (default: 5)
             
         Returns:
-            Dictionary mapping image_id to LNBNN score
+            Tuple of:
+            - Dictionary mapping image_id to LNBNN score
+            - Dictionary mapping image_id to list of cv2.DMatch objects
+              (trainIdx in matches refers to global descriptor index)
             
         Raises:
             RuntimeError: If index is not built
@@ -211,7 +235,7 @@ class GlobalFishMatcher:
             
         if query_descriptors is None or len(query_descriptors) == 0:
             logger.warning("Empty query descriptors")
-            return {}
+            return {}, {}
             
         # Ensure float32
         if query_descriptors.dtype != np.float32:
@@ -221,14 +245,15 @@ class GlobalFishMatcher:
         max_k = min(k + 1, len(self.labels))
         if max_k < 2:
             logger.warning("Database too small for LNBNN (need at least 2 descriptors)")
-            return {}
+            return {}, {}
             
         try:
             # KNN search: find k+1 nearest neighbors for each query descriptor
             knn_matches = self.matcher.knnMatch(query_descriptors, k=max_k)
             
-            # Initialize score accumulator
+            # Initialize accumulators
             scores: Dict[str, float] = {}
+            matches_by_image: Dict[str, List[cv2.DMatch]] = {}
             
             # Process each query descriptor
             for query_idx, match_list in enumerate(knn_matches):
@@ -251,7 +276,13 @@ class GlobalFishMatcher:
                     mask_target = (neighbor_img_indices == img_idx)
                     if not np.any(mask_target):
                         continue
-                    d_target = np.min(distances[mask_target])
+                    
+                    # Get the minimum distance and corresponding match index
+                    target_distances = distances[mask_target]
+                    target_indices_in_match_list = np.where(mask_target)[0]
+                    min_target_idx = target_indices_in_match_list[np.argmin(target_distances)]
+                    d_target = distances[min_target_idx]
+                    target_global_idx = indices[min_target_idx]
                     
                     # Find closest descriptor NOT in this image
                     mask_other = (neighbor_img_indices != img_idx)
@@ -259,15 +290,76 @@ class GlobalFishMatcher:
                         continue  # All neighbors are from same image
                     d_other = np.min(distances[mask_other])
                     
-                    # LNBNN score: how much closer is this feature to target than to others?
+                    # LNBNN score: squared distance difference per paper equation
+                    # δ_LNBNN = ||d_{k+1} - q||^2 - ||d_p - q||^2
                     # Only add positive scores (distinctive features)
                     if d_target < d_other:
-                        score_increment = d_other - d_target
+                        # Use squared distances as per paper
+                        score_increment = d_other ** 2 - d_target ** 2
                         img_id = self.label_map[img_idx]
                         scores[img_id] = scores.get(img_id, 0.0) + score_increment
                         
-            return scores
+                        # Create DMatch object for this correspondence
+                        # trainIdx stores global descriptor index (will be mapped to local later)
+                        match = cv2.DMatch()
+                        match.queryIdx = query_idx
+                        match.trainIdx = int(target_global_idx)  # Global index
+                        match.distance = float(d_target)
+                        
+                        if img_id not in matches_by_image:
+                            matches_by_image[img_id] = []
+                        matches_by_image[img_id].append(match)
+                        
+            return scores, matches_by_image
             
         except Exception as e:
             logger.error(f"LNBNN query failed: {e}")
-            return {}
+            return {}, {}
+    
+    def map_global_to_local_matches(
+        self,
+        matches: List[cv2.DMatch],
+        image_id: str,
+    ) -> List[cv2.DMatch]:
+        """Map matches from global descriptor indices to local indices for a specific image.
+        
+        Args:
+            matches: List of DMatch objects with trainIdx referring to global indices
+            image_id: Image ID to map matches for
+            
+        Returns:
+            List of DMatch objects with trainIdx referring to local indices within the image
+        """
+        if not self.is_built or self.descriptor_offsets is None:
+            raise RuntimeError("Index not built. Call build_index() first.")
+        
+        # Find image_idx for this image_id (reverse lookup)
+        image_idx = None
+        for idx, img_id in self.label_map.items():
+            if img_id == image_id:
+                image_idx = idx
+                break
+        
+        if image_idx is None:
+            logger.warning(f"Image ID {image_id} not found in label_map")
+            return []
+        
+        # Get offset for this image
+        offset = self.descriptor_offsets.get(image_idx)
+        if offset is None:
+            logger.warning(f"No offset found for image_idx {image_idx}")
+            return []
+        
+        # Map matches: subtract offset from global trainIdx to get local trainIdx
+        local_matches = []
+        for match in matches:
+            global_train_idx = match.trainIdx
+            # Verify this match belongs to the correct image
+            if global_train_idx < len(self.labels) and self.labels[global_train_idx] == image_idx:
+                local_match = cv2.DMatch()
+                local_match.queryIdx = match.queryIdx
+                local_match.trainIdx = global_train_idx - offset  # Map to local index
+                local_match.distance = match.distance
+                local_matches.append(local_match)
+        
+        return local_matches

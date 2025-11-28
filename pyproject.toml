@@ -32,6 +32,7 @@ dependencies = [
     "scipy>=1.10.0",
     "scikit-image>=0.20.0",  # For skeletonization and image processing
     "scikit-learn>=1.0.0",   # For PCA-based rotation alignment
+    "networkx>=3.0",        # For graph-based skeleton analysis
     
     # Data Management
     "pyyaml>=6.0",
