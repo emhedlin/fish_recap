@@ -328,9 +328,29 @@ uv run python scripts/process_images.py
 
 **Options:**
 - `--verbose`: Detailed logging
-- `--no-metrics`: Skip metric extraction
+- `--no-metrics`: Skip metric extraction (run standardization only)
 - `--no-standardize`: Skip standardization
-- `--no-skip-existing`: Force reprocessing
+- `--no-skip-existing`: Force reprocessing of all steps (by default, completed steps are skipped)
+
+**Skip Logic:**
+The script intelligently skips completed steps by checking for existing outputs:
+- **Segmentation**: Skipped if masks exist in `masks_dir`
+- **Metrics**: Skipped if entry exists in `metadata_dir/metrics.json` with valid metrics
+- **Standardization**: Skipped if both `{image}_standardized.png` and `{image}_standardized_mask.png` exist in `standardized_dir`
+
+When running standardization-only mode (`--no-metrics`), images with existing standardized outputs are automatically skipped, even if segmentation masks are missing. This allows you to re-run standardization on new images without reprocessing already-standardized ones.
+
+**Examples:**
+```bash
+# Run standardization only (skip images that already have standardized outputs)
+uv run python scripts/process_images.py --no-metrics
+
+# Force reprocessing of all steps (ignore existing outputs)
+uv run python scripts/process_images.py --no-skip-existing
+
+# Run only segmentation (skip metrics and standardization)
+uv run python scripts/process_images.py --no-metrics --no-standardize
+```
 
 #### Step 2: Metric Extraction
 
@@ -532,7 +552,7 @@ See `configs/config.yaml` for all options.
 - **GPU**: Use CUDA for SAM 3 (10x faster)
 - **Batch Processing**: Process multiple images (automatic)
 - **Feature Caching**: Features are cached in `data/processed/features/`
-- **Progress Tracking**: Resume interrupted runs (skips completed steps)
+- **Progress Tracking**: Resume interrupted runs (automatically skips completed steps based on output file existence)
 
 ## Development
 

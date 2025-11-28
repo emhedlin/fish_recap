@@ -14,10 +14,12 @@ from typing import Optional, Tuple
 
 import cv2
 import numpy as np
+import networkx as nx
 from PIL import Image, ImageOps
 from scipy import ndimage
 from scipy.ndimage import label
 from scipy.signal import find_peaks
+from scipy.spatial.distance import pdist, squareform
 from skimage import measure, morphology
 
 logger = logging.getLogger(__name__)
@@ -89,96 +91,119 @@ def detect_ruler_ticks(
     ruler_roi: np.ndarray,
     method: str = "sobel",
     min_tick_spacing: int = 15,
-    max_tick_spacing: int = 100,
+    max_tick_spacing: int = 150,
 ) -> Tuple[np.ndarray, float]:
     """Detect tick marks on ruler and calculate pixels per millimeter.
     
+    Uses deskewing to handle rotated rulers, Canny edge detection for cleaner edges,
+    and robust spacing calculation with outlier filtering.
+    
     Args:
         ruler_roi: Ruler region of interest image
-        method: Detection method ("sobel" or "hough")
+        method: Detection method (deprecated, kept for backward compatibility)
         min_tick_spacing: Minimum expected spacing between ticks in pixels
         max_tick_spacing: Maximum expected spacing between ticks in pixels
     
     Returns:
         Tuple of (tick_positions, pixels_per_mm) where tick_positions is array of x-coordinates
     """
-    # Convert to grayscale if needed
+    # 1. Pre-processing: Deskew the ruler ROI
+    # Convert to grayscale
     if ruler_roi.ndim == 3:
         gray = cv2.cvtColor(ruler_roi, cv2.COLOR_RGB2GRAY)
     else:
         gray = ruler_roi.copy()
     
-    if method == "sobel":
-        # Apply vertical Sobel filter to detect vertical tick marks
-        sobel_y = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-        sobel_y = np.abs(sobel_y)
-        
-        # Threshold to find strong vertical edges
-        _, binary = cv2.threshold(
-            sobel_y.astype(np.uint8),
-            0,
-            255,
-            cv2.THRESH_BINARY + cv2.THRESH_OTSU
-        )
-        
-        # Find vertical lines (ticks)
-        # Project onto horizontal axis (sum along columns)
-        horizontal_projection = np.sum(binary, axis=0)
-        
-        # --- FIX: Use Peak Finding instead of raw thresholding ---
-        # Previous logic selected every pixel above threshold (contiguous blocks).
-        # We want the PEAK of those blocks.
-        
-        # Calculate dynamic height threshold based on the signal
-        height_threshold = np.percentile(horizontal_projection, 70)
-        
-        tick_positions, _ = find_peaks(
-            horizontal_projection, 
-            height=height_threshold, 
-            distance=min_tick_spacing
-        )
-        
-    else:
-        raise ValueError(f"Unknown detection method: {method}")
+    # Otsu threshold to get binary ruler content
+    _, binary_roi = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
     
-    if len(tick_positions) < 2:
-        logger.warning(f"Found only {len(tick_positions)} tick positions, cannot calculate scale")
+    # Find contours of the markings
+    contours, _ = cv2.findContours(binary_roi, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        # Get the rotated rectangle of all points
+        all_points = np.vstack(contours)
+        rect = cv2.minAreaRect(all_points)
+        angle = rect[-1]
+        
+        # Fix cv2.minAreaRect angle quirks
+        if angle < -45:
+            angle = -(90 + angle)
+        else:
+            angle = -angle
+        
+        # Rotate image to make ticks perfectly vertical
+        (h, w) = gray.shape[:2]
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, angle, 1.0)
+        gray = cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    
+    # 2. Enhanced Edge Detection
+    # Use Canny instead of just Sobel for cleaner edges
+    edges = cv2.Canny(gray, 50, 150)
+    
+    # 3. Projection
+    # Sum along columns to get vertical signal
+    projection = np.sum(edges, axis=0)
+    
+    # Smooth signal to merge double-edges (left and right of a single line)
+    # A tick line has thickness. Canny gives 2 edges. Smoothing merges them into 1 peak.
+    smoothed = ndimage.gaussian_filter1d(projection, sigma=2.0)
+    
+    # 4. Find Peaks
+    # Dynamic height threshold
+    height_threshold = np.percentile(smoothed, 50)
+    peaks, _ = find_peaks(smoothed, height=height_threshold, distance=min_tick_spacing)
+    
+    if len(peaks) < 2:
+        logger.warning(f"Found only {len(peaks)} tick positions, cannot calculate scale")
         return np.array([]), 0.0
     
-    # Calculate distances between consecutive ticks
-    tick_distances = np.diff(np.sort(tick_positions))
+    # 5. Robust Spacing Calculation
+    diffs = np.diff(np.sort(peaks))
     
-    # Filter out distances that are too small or too large
-    # We accept a wider range of valid distances now that peak finding is robust
-    valid_distances = tick_distances[
-        (tick_distances >= min_tick_spacing) & (tick_distances <= max_tick_spacing)
+    # Filter statistical outliers using IQR
+    q1 = np.percentile(diffs, 25)
+    q3 = np.percentile(diffs, 75)
+    iqr = q3 - q1
+    valid_diffs = diffs[(diffs >= q1 - 1.5 * iqr) & (diffs <= q3 + 1.5 * iqr)]
+    
+    if len(valid_diffs) == 0:
+        valid_diffs = diffs
+    
+    # Also filter by min/max spacing constraints
+    valid_diffs = valid_diffs[
+        (valid_diffs >= min_tick_spacing) & (valid_diffs <= max_tick_spacing)
     ]
     
-    if len(valid_distances) == 0:
-        logger.warning("No valid tick distances found")
-        return tick_positions, 0.0
+    if len(valid_diffs) == 0:
+        logger.warning("No valid tick distances found after filtering")
+        return peaks, 0.0
     
-    # Calculate median distance (most robust to outliers)
-    median_distance = np.median(valid_distances)
+    # Get median
+    median_px = np.median(valid_diffs)
     
     # Assume ticks are millimeter marks
     # pixels_per_mm = median_distance_px (since distance between mm ticks is 1mm)
-    pixels_per_mm = float(median_distance)
+    pixels_per_mm = float(median_px)
     
     logger.debug(
-        f"Detected {len(tick_positions)} ticks, "
-        f"median spacing: {median_distance:.2f} px, "
+        f"Detected {len(peaks)} ticks, "
+        f"median spacing: {median_px:.2f} px, "
         f"pixels_per_mm: {pixels_per_mm:.2f}"
     )
     
-    return tick_positions, pixels_per_mm
+    return peaks, pixels_per_mm
 
 
 def measure_fish_length_medial_axis(
     fish_mask: np.ndarray,
     pixels_per_mm: float,
 ) -> Tuple[float, float]:
-    """Measure fish length using medial axis (skeletonization).
+    """Measure fish length using graph-based analysis of the medial axis.
+    
+    Calculates Euclidean distance along the longest path, correcting for diagonal pixels.
+    Uses networkx to build a graph from skeleton pixels and find the longest shortest path
+    between endpoints, effectively removing spurs and noise.
     
     Args:
         fish_mask: Binary mask of fish (H, W) with values 0 or 1
@@ -196,48 +221,79 @@ def measure_fish_length_medial_axis(
         return 0.0, 0.0
     
     try:
-        # Skeletonize the fish mask to get medial axis
-        # Convert to uint8 to ensure compatibility
+        # 1. Skeletonize
         skeleton = morphology.skeletonize(fish_mask.astype(np.uint8))
+        
+        # 2. Get coordinates of skeleton pixels
+        y_coords, x_coords = np.where(skeleton)
+        if len(y_coords) < 2:
+            logger.warning("Skeletonization produced fewer than 2 pixels")
+            return 0.0, 0.0
+        
+        # 3. Build a graph
+        # Points are nodes. Edges exist between 8-connected neighbors.
+        # Weights are Euclidean distances (1.0 or 1.414)
+        points = np.column_stack((y_coords, x_coords))
+        G = nx.Graph()
+        
+        # Add nodes
+        for i in range(len(points)):
+            G.add_node(i, pos=points[i])
+        
+        # Fast neighbor finding using image structure
+        # Create a map from (y,x) to node_index
+        coord_to_idx = {tuple(p): i for i, p in enumerate(points)}
+        
+        for r, c in points:
+            curr_idx = coord_to_idx[(r, c)]
+            # Check 8 neighbors
+            for dr in [-1, 0, 1]:
+                for dc in [-1, 0, 1]:
+                    if dr == 0 and dc == 0:
+                        continue
+                    neighbor = (r + dr, c + dc)
+                    if neighbor in coord_to_idx:
+                        neigh_idx = coord_to_idx[neighbor]
+                        # Euclidean distance
+                        dist = np.sqrt(dr**2 + dc**2)
+                        G.add_edge(curr_idx, neigh_idx, weight=dist)
+        
+        # 4. Find the endpoints (nodes with degree 1)
+        endpoints = [n for n, d in G.degree() if d == 1]
+        
+        # If skeleton is a loop or has no endpoints, pick arbitrary nodes
+        if len(endpoints) < 2:
+            endpoints = list(G.nodes())
+        
+        # 5. Find the longest shortest path (the main spine)
+        # We calculate shortest path between all pairs of endpoints
+        max_length = 0.0
+        
+        # If too many endpoints (noisy skeleton), just take the two farthest points roughly
+        # to avoid computing paths between adjacent noisy spurs
+        if len(endpoints) > 10:
+            # Optimization: only check paths between the two geometrically farthest pixels
+            pts = np.array([G.nodes[n]['pos'] for n in endpoints])
+            D = squareform(pdist(pts))
+            i, j = np.unravel_index(np.argmax(D), D.shape)
+            endpoints = [endpoints[i], endpoints[j]]
+        
+        for i in range(len(endpoints)):
+            for j in range(i + 1, len(endpoints)):
+                try:
+                    length = nx.shortest_path_length(
+                        G, source=endpoints[i], target=endpoints[j], weight='weight'
+                    )
+                    if length > max_length:
+                        max_length = length
+                except nx.NetworkXNoPath:
+                    continue
+        
+        length_px = float(max_length)
+    
     except Exception as e:
-        logger.warning(f"Skeletonization failed: {e}. Falling back to bounding box method.")
+        logger.warning(f"Graph skeleton measurement failed: {e}. Falling back to bounding box method.")
         return measure_fish_length_bounding_box(fish_mask, pixels_per_mm)
-    
-    # --- FIX: Robust Length Calculation ---
-    # Previous logic failed if the skeleton was fragmented (common).
-    # It would pick the "longest component" which might be a small rib or noise (146px).
-    
-    # Geodesic / Pixel Counting approach
-    # For a 1-pixel wide skeleton, the area (sum) is a decent approximation of length.
-    total_skeleton_pixels = int(np.sum(skeleton))  # Convert to Python int to avoid numpy scalar issues
-    
-    if total_skeleton_pixels == 0:
-        logger.warning("Skeletonization produced no features")
-        return 0.0, 0.0
-    
-    # Fallback sanity check: Compare with Major Axis
-    # Skeleton length should be roughly similar to the Ellipse Major Axis
-    contours = measure.find_contours(fish_mask.astype(float), 0.5)
-    major_axis_length = 0.0
-    if contours:
-        largest_contour = max(contours, key=len)
-        if len(largest_contour) >= 5:
-            contour_xy = np.column_stack([largest_contour[:, 1], largest_contour[:, 0]]).astype(np.float32)
-            ellipse = cv2.fitEllipse(contour_xy)
-            major_axis_length = float(max(ellipse[1]))  # Convert to Python float
-    
-    # If skeleton is severely broken (length < 50% of major axis), use major axis
-    if major_axis_length > 0 and total_skeleton_pixels < (0.5 * major_axis_length):
-        logger.warning(
-            f"Skeleton fragmented ({total_skeleton_pixels}px vs axis {major_axis_length:.0f}px). "
-            f"Falling back to major axis."
-        )
-        length_px = float(major_axis_length)
-    else:
-        # Refined skeleton measurement: Count pixels
-        # A perfect line of 10 pixels has length 10. Diagonals add distance.
-        # A simple heuristic is sufficient here given the noise.
-        length_px = float(total_skeleton_pixels)
     
     # Convert to mm
     if pixels_per_mm > 0:

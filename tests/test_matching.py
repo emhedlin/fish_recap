@@ -247,15 +247,19 @@ class TestGlobalFishMatcher(unittest.TestCase):
         if len(query_desc) == 0:
             self.skipTest("No query descriptors")
             
-        scores = matcher.query_lnbnn(query_desc, k=5)
+        scores, matches = matcher.query_lnbnn(query_desc, k=5)
         
-        # Should return scores for images in database
+        # Should return scores and matches for images in database
         self.assertIsInstance(scores, dict)
+        self.assertIsInstance(matches, dict)
         self.assertTrue(len(scores) > 0)
         
         # First image should have highest score (matching itself)
         if "image_0" in scores:
             self.assertTrue(scores["image_0"] > 0)
+            # Should also have matches for this image
+            if "image_0" in matches:
+                self.assertTrue(len(matches["image_0"]) > 0)
             
     def test_query_before_build(self):
         """Test that querying before building raises error."""
@@ -298,8 +302,9 @@ class TestGlobalFishMatcher(unittest.TestCase):
         matcher.build_index(descriptors, labels, label_map)
         
         # Query with empty descriptors
-        scores = matcher.query_lnbnn(np.array([]))
+        scores, matches = matcher.query_lnbnn(np.array([]))
         self.assertEqual(len(scores), 0)
+        self.assertEqual(len(matches), 0)
 
 if __name__ == '__main__':
     unittest.main()
