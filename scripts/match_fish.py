@@ -122,16 +122,25 @@ def run_pairwise_matching(
     verifier: GeometricVerifier,
     geo_config: dict,
     output_dir: Path,
+    features_dir: Path,
+    extractor: FeatureExtractor,
+    standardized_dir: Path,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Run pairwise (one-vs-one) matching pipeline.
     
+    Note: This function loads descriptors on-demand from pickle files for memory efficiency.
+    This is slower than keeping all descriptors in memory but allows processing large datasets.
+    
     Args:
-        database: Dictionary mapping image_id to features
+        database: Dictionary mapping image_id to features (light database with only keypoints)
         queries: List of query image paths
         matcher: Pairwise FLANN matcher
         verifier: Geometric verifier
         geo_config: Geometric verification configuration
         output_dir: Output directory for results
+        features_dir: Directory containing feature pickle files
+        extractor: Feature extractor for on-demand loading
+        standardized_dir: Directory containing standardized images
         
     Returns:
         Dictionary mapping query_id to list of match results
@@ -145,18 +154,31 @@ def run_pairwise_matching(
         
         if not query_feat:
             continue
-            
+        
+        # Load query descriptors on-demand
+        query_features = load_or_extract_features(
+            query_path, features_dir, extractor, force_recompute=False
+        )
         query_kp = query_feat["keypoints"]
-        query_desc = query_feat["descriptors"]
+        query_desc = query_features["descriptors"]
         
         query_results = []
         
         for db_id, db_feat in database.items():
             if db_id == query_id:
                 continue
-                
+            
+            # Load database descriptors on-demand
+            db_image_path = standardized_dir / f"{db_id}_standardized.png"
+            
+            if not db_image_path.exists():
+                continue
+            
+            db_features = load_or_extract_features(
+                db_image_path, features_dir, extractor, force_recompute=False
+            )
             db_kp = db_feat["keypoints"]
-            db_desc = db_feat["descriptors"]
+            db_desc = db_features["descriptors"]
             
             # Step A: Feature Matching
             matches = matcher.match(query_desc, db_desc)
@@ -188,6 +210,8 @@ def run_hotspotter_matching(
     match_config: dict,
     geo_config: dict,
     output_dir: Path,
+    features_dir: Path,
+    extractor: FeatureExtractor,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Run HotSpotter one-vs-many matching pipeline.
     
@@ -201,13 +225,15 @@ def run_hotspotter_matching(
     a specific animal when compared globally.
     
     Args:
-        database: Dictionary mapping image_id to features
+        database: Dictionary mapping image_id to features (light database with only keypoints)
         queries: List of query image paths
-        global_matcher: Global FLANN matcher with LNBNN scoring
+        global_matcher: Global FAISS matcher with LNBNN scoring
         verifier: Geometric verifier
         match_config: Matching configuration
         geo_config: Geometric verification configuration
         output_dir: Output directory for results
+        features_dir: Directory containing feature pickle files
+        extractor: Feature extractor for on-demand loading
         
     Returns:
         Dictionary mapping query_id to list of match results
@@ -224,13 +250,22 @@ def run_hotspotter_matching(
         
         if not query_feat:
             continue
-            
+        
+        # Load query descriptors on-demand (not stored in light database)
+        query_features = load_or_extract_features(
+            query_path, features_dir, extractor, force_recompute=False
+        )
         query_kp = query_feat["keypoints"]
-        query_desc = query_feat["descriptors"]
+        query_desc = query_features["descriptors"]
         
         # Step A: LNBNN Scoring (fast, checks all images)
         # Returns both scores and the specific matches that generated them
-        lnbnn_scores, lnbnn_matches = global_matcher.query_lnbnn(query_desc, k=lnbnn_k)
+        # Pass ignore_id=query_id to prevent self-matching from blocking other results
+        lnbnn_scores, lnbnn_matches = global_matcher.query_lnbnn(
+            query_desc, 
+            k=lnbnn_k, 
+            ignore_id=query_id
+        )
         
         if not lnbnn_scores:
             all_results[query_id] = []
@@ -350,28 +385,124 @@ def run_matching_pipeline(
         model=geo_config.get("model", "affine"),
     )
     
-    # 2. Build Database (Extract features for all images)
+    # 2. Build Database (Two-pass loading for memory efficiency)
     image_files = sorted(standardized_dir.glob("*_standardized.png"))
     if not image_files:
         logger.error(f"No standardized images found in {standardized_dir}")
         return
         
     logger.info(f"Building feature database for {len(image_files)} images...")
-    database = {}
-    valid_images = []
     
-    for img_path in tqdm(image_files, desc="Extracting features"):
-        features = load_or_extract_features(
-            img_path, features_dir, extractor, force_recompute
-        )
-        
-        if features.get("n_features", 0) > 0:
-            database[img_path.stem] = features
-            valid_images.append(img_path)
+    # First Pass: Count total descriptors without loading full data
+    logger.info("First pass: Counting descriptors...")
+    total_descriptors = 0
+    valid_images_map = {}  # path -> n_features
+    
+    for img_path in tqdm(image_files, desc="Counting"):
+        feat_path = features_dir / f"{img_path.stem}_features.pkl"
+        if feat_path.exists():
+            try:
+                with open(feat_path, 'rb') as f:
+                    # Load data, count descriptors, then delete
+                    data = pickle.load(f)
+                    n = len(data.get("descriptors", []))
+                    if n > 0:
+                        total_descriptors += n
+                        valid_images_map[img_path] = n
+                    del data
+            except Exception as e:
+                logger.warning(f"Failed to load features for {img_path.name}: {e}")
         else:
-            logger.warning(f"No features extracted for {img_path.name}")
-            
-    logger.info(f"Database built: {len(database)} valid images")
+            # If not computed, compute now
+            features = load_or_extract_features(
+                img_path, features_dir, extractor, force_recompute
+            )
+            n = len(features.get("descriptors", []))
+            if n > 0:
+                total_descriptors += n
+                valid_images_map[img_path] = n
+    
+    logger.info(f"Total descriptors to index: {total_descriptors}")
+    
+    if total_descriptors == 0:
+        logger.error("No valid descriptors found in database")
+        return
+    
+    # Second Pass: Pre-allocate arrays and fill sequentially
+    # Use memory mapping if RAM is insufficient
+    using_memmap = False
+    temp_desc_path = features_dir / 'temp_desc.dat'
+    temp_labels_path = features_dir / 'temp_labels.dat'
+    
+    try:
+        global_descriptors = np.zeros((total_descriptors, 128), dtype=np.float32)
+        global_labels = np.zeros(total_descriptors, dtype=np.int32)
+        logger.info("Allocated arrays in RAM")
+    except MemoryError:
+        logger.warning("RAM insufficient, using memory mapping on disk...")
+        using_memmap = True
+        global_descriptors = np.memmap(
+            temp_desc_path,
+            dtype='float32',
+            mode='w+',
+            shape=(total_descriptors, 128)
+        )
+        global_labels = np.memmap(
+            temp_labels_path,
+            dtype='int32',
+            mode='w+',
+            shape=(total_descriptors,)
+        )
+    
+    # Build light database (only keypoints, not descriptors)
+    database_light = {}
+    label_map = {}
+    current_idx = 0
+    img_index_counter = 0
+    
+    for img_path in tqdm(image_files, desc="Building Index"):
+        if img_path not in valid_images_map:
+            continue
+        
+        # Load data
+        feat_path = features_dir / f"{img_path.stem}_features.pkl"
+        with open(feat_path, 'rb') as f:
+            data = pickle.load(f)
+        
+        desc = data.get("descriptors", np.array([]))
+        n = len(desc)
+        
+        if n == 0:
+            continue
+        
+        # Fill global arrays
+        global_descriptors[current_idx : current_idx + n] = desc
+        global_labels[current_idx : current_idx + n] = img_index_counter
+        
+        label_map[img_index_counter] = img_path.stem
+        
+        # Store ONLY keypoints for verification (much smaller than 128-dim float descriptors)
+        # Convert back to cv2 objects immediately
+        if "keypoints_list" in data:
+            kp_objs = dict_to_keypoints(data["keypoints_list"])
+        elif "keypoints" in data:
+            kp_objs = data["keypoints"]
+            # Ensure they're cv2.KeyPoint objects
+            if len(kp_objs) > 0 and isinstance(kp_objs[0], dict):
+                kp_objs = dict_to_keypoints(kp_objs)
+        else:
+            kp_objs = []
+        
+        database_light[img_path.stem] = {
+            "keypoints": kp_objs,
+            # We DO NOT store "descriptors" here to save RAM
+        }
+        
+        current_idx += n
+        img_index_counter += 1
+    
+    logger.info(f"Database built: {len(database_light)} valid images")
+    valid_images = list(valid_images_map.keys())
     
     # 3. Define queries
     queries = []
@@ -397,39 +528,34 @@ def run_matching_pipeline(
     output_dir.mkdir(parents=True, exist_ok=True)
     
     if method == "hotspotter":
-        # Build global index
-        logger.info("Building global FLANN index...")
-        all_descriptors = []
-        all_labels = []
-        label_map = {}
-        
-        for img_idx, (img_id, feat) in enumerate(database.items()):
-            desc = feat["descriptors"]
-            if len(desc) == 0:
-                continue
-                
-            all_descriptors.append(desc)
-            n_desc = len(desc)
-            label_map[img_idx] = img_id
-            labels = np.full(n_desc, img_idx, dtype=np.int32)
-            all_labels.append(labels)
-            
-        if len(all_descriptors) == 0:
-            logger.error("No valid descriptors found in database")
-            return
-            
-        global_descriptors = np.vstack(all_descriptors)
-        global_labels = np.concatenate(all_labels)
+        # Build global FAISS index
+        logger.info("Building global FAISS index...")
         
         global_matcher = GlobalFishMatcher(
-            flann_index_type=match_config.get("flann_index_type", 1),
-            flann_trees=match_config.get("flann_trees", 5),
-            flann_checks=match_config.get("flann_checks", 50),
+            use_pq=match_config.get("use_pq", True),
+            flann_index_type=match_config.get("flann_index_type", 1),  # Deprecated but kept for compatibility
+            flann_trees=match_config.get("flann_trees", 5),  # Deprecated but kept for compatibility
+            flann_checks=match_config.get("flann_checks", 50),  # Deprecated but kept for compatibility
         )
         global_matcher.build_index(global_descriptors, global_labels, label_map)
         
+        # Clean up large arrays (index is built, we don't need raw descriptors anymore)
+        del global_descriptors
+        del global_labels
+        
+        # Clean up temporary memory-mapped files if they were created
+        if using_memmap:
+            try:
+                if temp_desc_path.exists():
+                    temp_desc_path.unlink()
+                if temp_labels_path.exists():
+                    temp_labels_path.unlink()
+                logger.info("Cleaned up temporary memory-mapped files")
+            except Exception as e:
+                logger.warning(f"Failed to clean up temporary files: {e}")
+        
         all_results = run_hotspotter_matching(
-            database, queries, global_matcher, verifier, match_config, geo_config, output_dir
+            database_light, queries, global_matcher, verifier, match_config, geo_config, output_dir, features_dir, extractor
         )
     else:  # pairwise
         matcher = FishMatcher(
@@ -440,7 +566,7 @@ def run_matching_pipeline(
         )
         
         all_results = run_pairwise_matching(
-            database, queries, matcher, verifier, geo_config, output_dir
+            database_light, queries, matcher, verifier, geo_config, output_dir, features_dir, extractor, standardized_dir
         )
         
     # 5. Save Results

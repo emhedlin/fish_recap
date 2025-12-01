@@ -26,6 +26,10 @@ scipy>=1.10.0
 scikit-image>=0.20.0  # For skeletonization and image processing
 scikit-learn>=1.0.0  # For PCA-based rotation alignment
 
+# Similarity Search
+faiss-cpu>=1.7.4  # For Product Quantization (IVFPQ) - reduces memory by ~16x
+# faiss-gpu>=1.7.4  # Use this instead if GPU is available
+
 # Data Management
 pyyaml>=6.0
 tqdm>=4.65.0
