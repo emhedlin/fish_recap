@@ -73,7 +73,7 @@ matches_df = (
         c.query_id.str.replace('_standardized', ''),
         c.match_id.str.replace('_standardized', ''),
     )
-    .filter(c.query_id != c.match_id)
+
 )
 
 matches_df.write_csv('data/results/matches.csv')
@@ -87,13 +87,19 @@ matches_df.write_csv('data/results/matches.csv')
 - Run the below
 ```{python}
 
-FISH_1 = 'CCAF_017_L'
-FISH_2 = 'CCAF_017_R'
+FISH_1 = 'CMAQ019L'
+FISH_2 = 'DCS_8063'
 
 
 
 
-matches_df = pl.read_csv('data/results/matches.csv')
+matches_df = (
+    pl.read_csv('data/results/matches.csv')
+    .filter(
+        c.query_id.str.replace_all('[RL]', '') != c.match_id.str.replace_all('[RL]', '')
+    )
+)
+
 compare_fish(FISH_1, FISH_2, STANDARDIZED_DIR, matches_df)
 ```
 
