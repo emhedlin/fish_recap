@@ -6,7 +6,7 @@ data:
   processed_dir: "data/processed"
   metadata_dir: "data/metadata"
   masks_dir: "data/processed/masks"
-  standardized_dir: "data/processed/standardized"
+  standardized_dir: "/home/erikhedlin/Dropbox/fish_standardized"
   features_dir: "data/processed/features"
 
 # Model paths

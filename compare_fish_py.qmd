@@ -1,0 +1,100 @@
+
+## Setup
+
+```{python}
+import json
+from pathlib import Path
+from typing import Optional
+import re
+import yaml
+import polars as pl
+from polars import col as c
+from PIL import Image
+import matplotlib.pyplot as plt
+from src.visual import compare_fish
+
+PROJECT_ROOT = Path(".")
+CONFIG_PATH = PROJECT_ROOT / "configs" / "config.yaml"
+
+with open(CONFIG_PATH, 'r') as f:
+    config = yaml.safe_load(f)
+
+def resolve_path(config_path: str) -> Path:
+    """Resolve path from config, handling both absolute and relative paths."""
+    path = Path(config_path)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+# Set paths from config
+STANDARDIZED_DIR = resolve_path(config["data"]["standardized_dir"])
+RESULTS_PATH = PROJECT_ROOT / "data" / "results" / "matching_results.json"
+
+print(f"Standardized images directory: {STANDARDIZED_DIR}")
+print(f"Matching results file: {RESULTS_PATH}")
+
+# Display settings
+plt.rcParams['figure.figsize'] = (12, 8)
+plt.rcParams['figure.dpi'] = 100
+
+with open(RESULTS_PATH, 'r') as f:
+    matching_results = json.load(f)
+```
+
+
+
+## Create Matches DataFrame
+```{python}
+from src.visual import extract_side
+
+# Convert matching results to polars DataFrame
+match_rows = []
+for query_id, matches in matching_results.items():
+    side = extract_side(query_id)
+    
+    for match in matches:        
+        match_side = extract_side(match["match_id"])
+        
+        match_row = {
+            "query_id": query_id,
+            "query_side": side,
+            "match_id": match["match_id"],
+            "match_side": match_side,
+            "score": match["score"],
+            "inliers": match["inliers"],
+            "total_matches": match["total_matches"],
+            "inlier_ratio": match["inliers"] / match["total_matches"] if match["total_matches"] > 0 else 0.0,
+            "lnbnn_score": match.get("lnbnn_score"),
+        }
+        match_rows.append(match_row)
+
+# Scan all rows to properly infer schema (handles None values correctly)
+matches_df = (
+    pl.DataFrame(match_rows, infer_schema_length=None)
+    .with_columns(
+        c.query_id.str.replace('_standardized', ''),
+        c.match_id.str.replace('_standardized', ''),
+    )
+    .filter(c.query_id != c.match_id)
+)
+
+matches_df.write_csv('data/results/matches.csv')
+```
+
+
+
+
+
+## Fish Comparison Function
+- Run the below
+```{python}
+
+FISH_1 = 'CCAF_017_L'
+FISH_2 = 'CCAF_017_R'
+
+
+
+
+matches_df = pl.read_csv('data/results/matches.csv')
+compare_fish(FISH_1, FISH_2, STANDARDIZED_DIR, matches_df)
+```
+
+
