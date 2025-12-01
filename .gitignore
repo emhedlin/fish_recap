@@ -23,6 +23,7 @@ MANIFEST
 PROGRESS.md
 hotspotter_roadmap.md
 .cursorrules
+matching_algo.md
 
 # Virtual Environment
 venv/
