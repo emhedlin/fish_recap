@@ -87,11 +87,8 @@ matches_df.write_csv('data/results/matches.csv')
 - Run the below
 ```{python}
 
-FISH_1 = 'CMAQ019L'
-FISH_2 = 'DCS_8063'
-
-
-
+FISH_1 = 'CSFI002R'
+FISH_2 = 'JAVR0982L'
 
 matches_df = (
     pl.read_csv('data/results/matches.csv')
