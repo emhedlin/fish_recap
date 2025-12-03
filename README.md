@@ -1,6 +1,6 @@
 # Fish Re-Identification Pipeline
 
-This repository contains a pipeline for automated stream fish re-identification using natural spot patterns and computer vision.
+This repository contains a pipeline for automated stream fish re-identification using natural spot patterns.
 
 ![Fish Illustration](documents/sketch.jpeg)
 
