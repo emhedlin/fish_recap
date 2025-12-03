@@ -2,6 +2,8 @@
 
 This repository contains a pipeline for automated stream fish re-identification using natural spot patterns and computer vision.
 
+![Fish Illustration](documents/sketch.jpeg)
+
 ## Installing uv
 
 Before setting up the project, you need to install `uv`, a fast Python package installer and resolver.
