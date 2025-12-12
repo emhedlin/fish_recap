@@ -1,0 +1,416 @@
+
+## Setup
+
+```{python}
+import json
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+import yaml
+import polars as pl
+from polars import col as c
+import cv2
+import numpy as np
+import matplotlib.pyplot as plt
+from src.matching.feature_extraction import FeatureExtractor
+from src.matching.matcher import FishMatcher
+from src.matching.geometric_verification import GeometricVerifier
+from src.visual import (
+    visualize_single_image_features,
+    visualize_matched_features,
+    extract_side,
+)
+
+PROJECT_ROOT = Path(".")
+CONFIG_PATH = PROJECT_ROOT / "configs" / "config.yaml"
+
+with open(CONFIG_PATH, 'r') as f:
+    config = yaml.safe_load(f)
+
+def resolve_path(config_path: str) -> Path:
+    """Resolve path from config, handling both absolute and relative paths."""
+    path = Path(config_path)
+    return path if path.is_absolute() else PROJECT_ROOT / path
+
+# Set paths from config
+STANDARDIZED_DIR = resolve_path(config["data"]["standardized_dir"])
+FEATURES_DIR = resolve_path(config["data"]["features_dir"])
+RESULTS_PATH = PROJECT_ROOT / "data" / "results" / "matching_results.json"
+
+print(f"Standardized images directory: {STANDARDIZED_DIR}")
+print(f"Features directory: {FEATURES_DIR}")
+print(f"Matching results file: {RESULTS_PATH}")
+
+# Display settings
+plt.rcParams['figure.figsize'] = (12, 8)
+plt.rcParams['figure.dpi'] = 100
+
+# Initialize feature extractor
+feat_config = config.get("feature_extraction", {})
+extractor = FeatureExtractor(
+    method=feat_config.get("method", "sift"),
+    n_features=feat_config.get("n_features", 0),
+    contrast_threshold=feat_config.get("contrast_threshold", 0.04),
+    edge_threshold=feat_config.get("edge_threshold", 10),
+    sigma=feat_config.get("sigma", 1.6),
+)
+
+# Load matching results if available
+matching_results = {}
+if RESULTS_PATH.exists():
+    with open(RESULTS_PATH, 'r') as f:
+        matching_results = json.load(f)
+    print(f"Loaded matching results for {len(matching_results)} queries")
+else:
+    print("No matching results found. Pair visualization will compute matches on-the-fly.")
+```
+
+
+
+## Single Image Feature Visualization
+
+Visualize SIFT features for a single fish image. This shows:
+1. **Location & Scale**: Keypoints with circle size indicating feature scale
+2. **Feature Similarity**: PCA-reduced descriptors mapped to RGB colors (same color = similar texture)
+3. **Feature Density**: Heatmap showing where features are concentrated
+
+### All Panels (Default)
+
+```{python}
+# Set the fish ID you want to visualize
+FISH_ID = 'CSFI002R'  # Change this to any fish ID
+
+# Construct image path
+image_path = STANDARDIZED_DIR / f"{FISH_ID}_standardized.png"
+
+if image_path.exists():
+    # Show all three panels (default behavior)
+    visualize_single_image_features(
+        image_path=image_path,
+        features_dir=FEATURES_DIR,
+        extractor=extractor,
+        force_recompute=False
+    )
+else:
+    print(f"Image not found: {image_path}")
+```
+
+### Select Specific Panels
+
+You can choose which visualizations to show using the `panels` parameter:
+
+```{python}
+# Show only location & scale
+visualize_single_image_features(
+    image_path=image_path,
+    features_dir=FEATURES_DIR,
+    extractor=extractor,
+    panels=['location']
+)
+
+# Show only feature similarity
+visualize_single_image_features(
+    image_path=image_path,
+    features_dir=FEATURES_DIR,
+    extractor=extractor,
+    panels=['similarity']
+)
+
+# Show only density heatmap
+visualize_single_image_features(
+    image_path=image_path,
+    features_dir=FEATURES_DIR,
+    extractor=extractor,
+    panels=['density']
+)
+
+# Show any combination (e.g., location and similarity)
+visualize_single_image_features(
+    image_path=image_path,
+    features_dir=FEATURES_DIR,
+    extractor=extractor,
+    panels=['location', 'similarity']
+)
+```
+
+### Adjust Resolution
+
+Use the `resolution` parameter to scale down images for better viewing. The parameter ranges from 0 to 1, where 1.0 = original resolution:
+
+```{python}
+# Full resolution (default)
+visualize_single_image_features(
+    image_path=image_path,
+    features_dir=FEATURES_DIR,
+    extractor=extractor,
+    resolution=1.0,
+    panels=['similarity']
+)
+
+# Half resolution (easier to see, faster rendering)
+visualize_single_image_features(
+    image_path=image_path,
+    features_dir=FEATURES_DIR,
+    extractor=extractor,
+    resolution=0.5
+)
+
+# Quarter resolution (very easy to see)
+visualize_single_image_features(
+    image_path=image_path,
+    features_dir=FEATURES_DIR,
+    extractor=extractor,
+    resolution=0.25
+)
+
+# Combine resolution with panel selection
+visualize_single_image_features(
+    image_path=image_path,
+    features_dir=FEATURES_DIR,
+    extractor=extractor,
+    panels=['location', 'similarity'],
+    resolution=0.5
+)
+```
+
+### Save Visualizations
+
+Use the `save_path` parameter to save visualizations to disk:
+
+```{python}
+# Save to a specific path
+visualize_single_image_features(
+    image_path=image_path,
+    features_dir=FEATURES_DIR,
+    extractor=extractor,
+    resolution=0.5,
+    panels=['similarity'],
+    save_path=Path("output") / f"{FISH_ID}_features.png"
+)
+
+# Save with high resolution
+visualize_single_image_features(
+    image_path=image_path,
+    features_dir=FEATURES_DIR,
+    extractor=extractor,
+    resolution=1.0,
+    panels=['similarity'],
+    save_path=Path("output") / f"{FISH_ID}_features_highres.png",
+    dpi=300  # High resolution
+)
+
+# Save as PDF (vector format, good for publications)
+visualize_single_image_features(
+    image_path=image_path,
+    features_dir=FEATURES_DIR,
+    extractor=extractor,
+    panels=['location', 'similarity', 'density'],
+    save_path=Path("output") / f"{FISH_ID}_features.pdf"
+)
+```
+
+
+## Pair Feature Visualization
+
+Visualize matched features between two fish images. This shows:
+1. **Matched Keypoints**: Side-by-side images with matched keypoints connected by lines
+2. **Individual Features**: Feature visualizations for each image separately
+
+### Option A: Using Pre-computed Matches
+
+If you have matching results from `match_fish.py`, use this:
+
+```{python}
+FISH_1 = 'CSFI002R'
+FISH_2 = 'JAVR0982L'
+
+# Load matches DataFrame if available
+matches_df = None
+matches_csv_path = PROJECT_ROOT / "data" / "results" / "matches.csv"
+if matches_csv_path.exists():
+    matches_df = pl.read_csv(matches_csv_path)
+    print("Loaded matches DataFrame")
+else:
+    print("Matches CSV not found. Will compute matches on-the-fly.")
+
+# Helper function to load matches from matching results
+def get_matches_from_results(
+    query_id: str,
+    match_id: str,
+    matching_results: Dict[str, List[Dict[str, Any]]]
+) -> Optional[Dict[str, Any]]:
+    """Get match information from pre-computed results."""
+    # Try query_id as query
+    if query_id in matching_results:
+        for match in matching_results[query_id]:
+            if match["match_id"] == match_id:
+                return match
+    
+    # Try reverse (match_id as query)
+    if match_id in matching_results:
+        for match in matching_results[match_id]:
+            if match["match_id"] == query_id:
+                return match
+    
+    return None
+
+# Load features and compute matches
+image_path_1 = STANDARDIZED_DIR / f"{FISH_1}_standardized.png"
+image_path_2 = STANDARDIZED_DIR / f"{FISH_2}_standardized.png"
+
+if not image_path_1.exists() or not image_path_2.exists():
+    print(f"Error: One or both images not found")
+    print(f"  {image_path_1}: {image_path_1.exists()}")
+    print(f"  {image_path_2}: {image_path_2.exists()}")
+else:
+    # Load features
+    from src.visual.fish_comparison import load_features_from_pickle
+    
+    features1 = load_features_from_pickle(image_path_1, FEATURES_DIR)
+    features2 = load_features_from_pickle(image_path_2, FEATURES_DIR)
+    
+    if features1 is None:
+        features1 = extractor.process_image(image_path_1)
+    if features2 is None:
+        features2 = extractor.process_image(image_path_2)
+    
+    keypoints1 = features1.get("keypoints", [])
+    keypoints2 = features2.get("keypoints", [])
+    descriptors1 = features1.get("descriptors", np.array([]))
+    descriptors2 = features2.get("descriptors", np.array([]))
+    
+    if len(keypoints1) == 0 or len(keypoints2) == 0:
+        print("Error: No features found in one or both images")
+    else:
+        # Compute matches
+        match_config = config.get("matching", {})
+        matcher = FishMatcher(
+            flann_index_type=match_config.get("flann_index_type", 1),
+            flann_trees=match_config.get("flann_trees", 5),
+            flann_checks=match_config.get("flann_checks", 50),
+            ratio_threshold=match_config.get("ratio_threshold", 0.75),
+        )
+        
+        matches = matcher.match(descriptors1, descriptors2)
+        
+        # Get match info from results if available
+        match_info = get_matches_from_results(
+            f"{FISH_1}_standardized",
+            f"{FISH_2}_standardized",
+            matching_results
+        )
+        
+        if match_info is None:
+            # Compute geometric verification for match info
+            geo_config = config.get("geometric_verification", {})
+            verifier = GeometricVerifier(
+                ransac_threshold=geo_config.get("ransac_threshold", 5.0),
+                min_inliers=geo_config.get("min_inliers", 10),
+                confidence=geo_config.get("confidence", 0.99),
+                max_iterations=geo_config.get("max_iterations", 2000),
+                model=geo_config.get("model", "affine"),
+            )
+            
+            num_inliers, H, inlier_matches = verifier.verify(keypoints1, keypoints2, matches)
+            match_info = {
+                "score": verifier.calculate_score(num_inliers, len(matches)),
+                "inliers": num_inliers,
+                "total_matches": len(matches),
+            }
+        
+        # Visualize matched features
+        visualize_matched_features(
+            image_path_1=image_path_1,
+            image_path_2=image_path_2,
+            features_dir=FEATURES_DIR,
+            matches=matches,
+            extractor=extractor,
+            match_info=match_info
+        )
+```
+
+
+
+### Option B: Visualize Top Match
+
+Visualize a fish with its top-ranked match from the matching results:
+
+```{python}
+from src.visual import get_top_matches
+
+FISH_ID = 'CSFI002R'
+RANK = 1  # 1 = best match, 2 = second best, etc.
+
+# Load matches DataFrame
+matches_df = None
+matches_csv_path = PROJECT_ROOT / "data" / "results" / "matches.csv"
+if matches_csv_path.exists():
+    matches_df = pl.read_csv(matches_csv_path)
+    
+    # Get top match
+    top_matches = get_top_matches(FISH_ID, matches_df, top_n=RANK)
+    
+    if len(top_matches) >= RANK:
+        match_row = top_matches.to_dicts()[RANK - 1]
+        match_fish_id = match_row["match_id"]
+        
+        print(f"Visualizing {FISH_ID} with its #{RANK} match: {match_fish_id}")
+        
+        # Load image paths
+        image_path_1 = STANDARDIZED_DIR / f"{FISH_ID}_standardized.png"
+        image_path_2 = STANDARDIZED_DIR / f"{match_fish_id}_standardized.png"
+        
+        if image_path_1.exists() and image_path_2.exists():
+            # Load features
+            from src.visual.fish_comparison import load_features_from_pickle
+            
+            features1 = load_features_from_pickle(image_path_1, FEATURES_DIR)
+            features2 = load_features_from_pickle(image_path_2, FEATURES_DIR)
+            
+            if features1 is None:
+                features1 = extractor.process_image(image_path_1)
+            if features2 is None:
+                features2 = extractor.process_image(image_path_2)
+            
+            keypoints1 = features1.get("keypoints", [])
+            keypoints2 = features2.get("keypoints", [])
+            descriptors1 = features1.get("descriptors", np.array([]))
+            descriptors2 = features2.get("descriptors", np.array([]))
+            
+            if len(keypoints1) > 0 and len(keypoints2) > 0:
+                # Compute matches
+                match_config = config.get("matching", {})
+                matcher = FishMatcher(
+                    flann_index_type=match_config.get("flann_index_type", 1),
+                    flann_trees=match_config.get("flann_trees", 5),
+                    flann_checks=match_config.get("flann_checks", 50),
+                    ratio_threshold=match_config.get("ratio_threshold", 0.75),
+                )
+                
+                matches = matcher.match(descriptors1, descriptors2)
+                
+                # Use match info from DataFrame
+                match_info = {
+                    "score": match_row["score"],
+                    "inliers": match_row["inliers"],
+                    "total_matches": match_row["total_matches"],
+                }
+                
+                # Visualize
+                visualize_matched_features(
+                    image_path_1=image_path_1,
+                    image_path_2=image_path_2,
+                    features_dir=FEATURES_DIR,
+                    matches=matches,
+                    extractor=extractor,
+                    match_info=match_info
+                )
+            else:
+                print("Error: No features found in one or both images")
+        else:
+            print(f"Error: One or both images not found")
+    else:
+        print(f"Fish {FISH_ID} has fewer than {RANK} matches")
+else:
+    print("Matches CSV not found. Run 'match_fish.py' first to generate matches.")
+```
+
